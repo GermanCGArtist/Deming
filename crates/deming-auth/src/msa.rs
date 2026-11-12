@@ -10,18 +10,29 @@ use serde_json::json;
 use uuid::Uuid;
 
 const DEFAULT_OAUTH_BASE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
+const DEFAULT_LIVE_AUTHORIZE_URL: &str = "https://login.live.com/oauth20_authorize.srf";
+const DEFAULT_LIVE_TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
+const DEFAULT_LIVE_REDIRECT_URI: &str = "https://login.live.com/oauth20_desktop.srf";
 const DEFAULT_XBL_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const DEFAULT_XSTS_AUTH_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const DEFAULT_MC_SERVICES_BASE_URL: &str = "https://api.minecraftservices.com";
 const DEFAULT_OAUTH_SCOPE: &str = "XboxLive.signin offline_access";
 
+/// Mojang's public Xbox/Minecraft client ID for `login.live.com` browser OAuth.
+pub const MOJANG_CLIENT_ID: &str = "00000000402b5328";
+
 /// Configurable endpoint URLs for Microsoft, Xbox Live, XSTS, and Minecraft Services.
 ///
 /// Overriding these endpoints allows tests to run the full auth flow against a local mock server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MsaEndpoints {
     /// Base URL for Microsoft OAuth2 endpoints (`/devicecode`, `/token`).
     pub oauth_base_url: String,
+    /// Full URL for Live Connect browser authorization (`login.live.com/oauth20_authorize.srf`).
+    pub live_authorize_url: String,
+    /// Full URL for Live Connect token exchange/refresh (`login.live.com/oauth20_token.srf`).
+    pub live_token_url: String,
     /// Full URL for Xbox Live user authentication (`user.auth.xboxlive.com/user/authenticate`).
     pub xbl_auth_url: String,
     /// Full URL for XSTS token authorization (`xsts.auth.xboxlive.com/xsts/authorize`).
@@ -34,6 +45,8 @@ impl Default for MsaEndpoints {
     fn default() -> Self {
         Self {
             oauth_base_url: DEFAULT_OAUTH_BASE_URL.to_string(),
+            live_authorize_url: DEFAULT_LIVE_AUTHORIZE_URL.to_string(),
+            live_token_url: DEFAULT_LIVE_TOKEN_URL.to_string(),
             xbl_auth_url: DEFAULT_XBL_AUTH_URL.to_string(),
             xsts_auth_url: DEFAULT_XSTS_AUTH_URL.to_string(),
             mc_services_base_url: DEFAULT_MC_SERVICES_BASE_URL.to_string(),
@@ -47,6 +60,8 @@ impl MsaEndpoints {
         let base = base_url.trim_end_matches('/');
         Self {
             oauth_base_url: format!("{base}/oauth2/v2.0"),
+            live_authorize_url: format!("{base}/oauth20_authorize.srf"),
+            live_token_url: format!("{base}/oauth20_token.srf"),
             xbl_auth_url: format!("{base}/user/authenticate"),
             xsts_auth_url: format!("{base}/xsts/authorize"),
             mc_services_base_url: base.to_string(),
@@ -129,6 +144,104 @@ impl MsaClient {
         }
     }
 
+    /// Returns the `login.live.com` browser OAuth authorization URL for this client ID.
+    pub fn browser_authorize_url(&self) -> String {
+        format!(
+            "{}?client_id={}&response_type=code&redirect_uri=https%3A%2F%2Flogin.live.com%2Foauth20_desktop.srf&scope=XboxLive.signin%20offline_access",
+            self.endpoints.live_authorize_url.trim_end_matches('/'),
+            self.client_id
+        )
+    }
+
+    /// Extracts an OAuth authorization `code` from either a full redirect URL
+    /// (`https://login.live.com/oauth20_desktop.srf?code=M.R3_BAY...&lc=...`) or a raw code string.
+    pub fn extract_auth_code(input: &str) -> Result<String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(DemingError::Auth(
+                "authorization code or redirect URL cannot be empty".to_string(),
+            ));
+        }
+
+        if trimmed.contains('?') || trimmed.starts_with("http://") || trimmed.starts_with("https://")
+        {
+            let query = trimmed.split('?').nth(1).unwrap_or("");
+            let query = query.split('#').next().unwrap_or("");
+
+            let mut code: Option<String> = None;
+            let mut error: Option<String> = None;
+            let mut error_desc: Option<String> = None;
+
+            for pair in query.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                match k {
+                    "code" if !v.is_empty() => code = Some(percent_decode(v)),
+                    "error" if !v.is_empty() => error = Some(percent_decode(v)),
+                    "error_description" if !v.is_empty() => error_desc = Some(percent_decode(v)),
+                    _ => {}
+                }
+            }
+
+            if let Some(err) = error {
+                let desc = error_desc.unwrap_or_default();
+                return Err(DemingError::Auth(format!(
+                    "microsoft browser oauth returned error '{err}': {desc}"
+                )));
+            }
+
+            return code.ok_or_else(|| {
+                DemingError::Auth(
+                    "redirect URL does not contain a 'code' query parameter".to_string(),
+                )
+            });
+        }
+
+        if trimmed.chars().any(char::is_whitespace) {
+            return Err(DemingError::Auth(
+                "authorization code cannot contain whitespace".to_string(),
+            ));
+        }
+
+        Ok(trimmed.to_string())
+    }
+
+    /// Exchanges a browser OAuth redirect URL or raw authorization code at `login.live.com`
+    /// and completes the Xbox Live -> XSTS -> Minecraft Services -> Profile authentication chain.
+    pub async fn complete_browser_login(&self, code_or_url: &str) -> Result<MsaSession> {
+        let code = Self::extract_auth_code(code_or_url)?;
+        let resp = self
+            .http
+            .post(&self.endpoints.live_token_url)
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("code", code.as_str()),
+                ("grant_type", "authorization_code"),
+                ("redirect_uri", DEFAULT_LIVE_REDIRECT_URI),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                DemingError::Network(format!("browser token exchange request failed: {e}"))
+            })?;
+
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| {
+            DemingError::Network(format!("failed reading browser token body: {e}"))
+        })?;
+
+        if !status.is_success() {
+            return Err(DemingError::Auth(format!(
+                "browser token exchange failed with HTTP {status}: {body}"
+            )));
+        }
+
+        let token: RawMsaTokenResponse = serde_json::from_str(&body)?;
+        self.complete_login_with_msa_tokens(token).await
+    }
+
     /// Initiates the Microsoft OAuth2 Device-Code flow.
     pub async fn start_device_code(&self) -> Result<DeviceCodePrompt> {
         let url = format!(
@@ -176,23 +289,38 @@ impl MsaClient {
     }
 
     /// Refreshes an expired session using the stored Microsoft OAuth2 refresh token.
+    ///
+    /// Uses `login.live.com` when `client_id` is Mojang's public client ID (`00000000402b5328`),
+    /// and the configured Microsoft OAuth2 `/token` endpoint otherwise.
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<MsaSession> {
-        let url = format!(
-            "{}/token",
-            self.endpoints.oauth_base_url.trim_end_matches('/')
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", self.client_id.as_str()),
-                ("refresh_token", refresh_token),
-                ("scope", self.scope.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|e| DemingError::Network(format!("token refresh request failed: {e}")))?;
+        let resp = if self.client_id == MOJANG_CLIENT_ID {
+            self.http
+                .post(&self.endpoints.live_token_url)
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", self.client_id.as_str()),
+                    ("refresh_token", refresh_token),
+                    ("redirect_uri", DEFAULT_LIVE_REDIRECT_URI),
+                ])
+                .send()
+                .await
+        } else {
+            let url = format!(
+                "{}/token",
+                self.endpoints.oauth_base_url.trim_end_matches('/')
+            );
+            self.http
+                .post(&url)
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", self.client_id.as_str()),
+                    ("refresh_token", refresh_token),
+                    ("scope", self.scope.as_str()),
+                ])
+                .send()
+                .await
+        }
+        .map_err(|e| DemingError::Network(format!("token refresh request failed: {e}")))?;
 
         let status = resp.status();
         let body = resp
@@ -550,4 +678,62 @@ fn default_mc_expires_in() -> u64 {
 struct RawMcProfileResponse {
     id: String,
     name: String,
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_authorize_url_matches_live_oauth_format() {
+        let client = MsaClient::new(MOJANG_CLIENT_ID);
+        assert_eq!(
+            client.browser_authorize_url(),
+            "https://login.live.com/oauth20_authorize.srf?client_id=00000000402b5328&response_type=code&redirect_uri=https%3A%2F%2Flogin.live.com%2Foauth20_desktop.srf&scope=XboxLive.signin%20offline_access"
+        );
+    }
+
+    #[test]
+    fn extract_auth_code_handles_redirect_url_and_raw_code() {
+        let url = "https://login.live.com/oauth20_desktop.srf?code=M.R3_BAY.abc-123_xyz&lc=1033";
+        assert_eq!(
+            MsaClient::extract_auth_code(url).expect("extract from URL"),
+            "M.R3_BAY.abc-123_xyz"
+        );
+
+        let encoded = "https://login.live.com/oauth20_desktop.srf?lc=1033&code=M.R3_BAY%2Btest%3D1#frag";
+        assert_eq!(
+            MsaClient::extract_auth_code(encoded).expect("extract percent-encoded"),
+            "M.R3_BAY+test=1"
+        );
+
+        assert_eq!(
+            MsaClient::extract_auth_code("  M.R3_BAY.raw-code  ").expect("extract raw code"),
+            "M.R3_BAY.raw-code"
+        );
+
+        assert!(MsaClient::extract_auth_code("").is_err());
+        assert!(MsaClient::extract_auth_code("https://login.live.com/oauth20_desktop.srf?lc=1033").is_err());
+        assert!(MsaClient::extract_auth_code("https://login.live.com/oauth20_desktop.srf?error=access_denied&error_description=User%20cancelled").is_err());
+    }
 }

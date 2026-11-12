@@ -300,6 +300,10 @@ impl Default for HistoryState {
 pub struct AccountsState {
     pub accounts: Vec<StoredAccount>,
     pub offline_username: String,
+    pub browser_code_input: String,
+    pub browser_login_in_flight: bool,
+    pub browser_status_msg: Option<String>,
+    pub browser_is_error: bool,
     pub msa_client_id: String,
     pub msa_prompt: Option<DeviceCodePrompt>,
     pub msa_polling: bool,
@@ -312,6 +316,10 @@ impl Default for AccountsState {
         Self {
             accounts: Vec::new(),
             offline_username: String::new(),
+            browser_code_input: String::new(),
+            browser_login_in_flight: false,
+            browser_status_msg: None,
+            browser_is_error: false,
             msa_client_id: DEFAULT_MSA_CLIENT_ID.to_string(),
             msa_prompt: None,
             msa_polling: false,

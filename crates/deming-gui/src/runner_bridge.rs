@@ -25,8 +25,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-/// Default Microsoft Azure public client ID for Minecraft OAuth Device-Code flow.
-pub const DEFAULT_MSA_CLIENT_ID: &str = "00000000402b5328";
+/// Default Microsoft Azure public client ID for Minecraft OAuth flows.
+pub const DEFAULT_MSA_CLIENT_ID: &str = deming_auth::msa::MOJANG_CLIENT_ID;
 
 /// Resolves the path where `DemingConfig` is persisted on disk.
 pub fn default_config_path() -> PathBuf {
@@ -74,6 +74,7 @@ pub enum BridgeMessage {
     },
     MsaDeviceCodeReady(Result<DeviceCodePrompt, String>),
     MsaLoginFinished(Result<MsaSession, String>),
+    MsaBrowserLoginFinished(Result<MsaSession, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +424,43 @@ impl GuiBridge {
                             emit_ui(&ui_tx, &egui_ctx, BridgeMessage::MsaLoginFinished(Err(e.to_string())));
                         }
                     }
+                }
+            }
+        });
+    }
+
+    /// Completes a Microsoft Browser OAuth (`login.live.com`) login from a pasted redirect URL or authorization code.
+    pub fn complete_browser_login(&self, config: DemingConfig, code_or_url: String) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+
+        self.runtime.spawn(async move {
+            let client = MsaClient::new(DEFAULT_MSA_CLIENT_ID);
+            match client.complete_browser_login(&code_or_url).await {
+                Ok(session) => {
+                    let store = AccountStore::from_config(&config);
+                    if let Err(e) = store.upsert(StoredAccount::from_msa(&session)) {
+                        emit_ui(
+                            &ui_tx,
+                            &egui_ctx,
+                            BridgeMessage::MsaBrowserLoginFinished(Err(format!(
+                                "Login succeeded but failed to save account: {e}"
+                            ))),
+                        );
+                    } else {
+                        emit_ui(
+                            &ui_tx,
+                            &egui_ctx,
+                            BridgeMessage::MsaBrowserLoginFinished(Ok(session)),
+                        );
+                    }
+                }
+                Err(e) => {
+                    emit_ui(
+                        &ui_tx,
+                        &egui_ctx,
+                        BridgeMessage::MsaBrowserLoginFinished(Err(e.to_string())),
+                    );
                 }
             }
         });

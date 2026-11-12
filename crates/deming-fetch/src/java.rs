@@ -38,12 +38,17 @@ pub struct AdoptiumPackage {
     pub name: String,
 }
 
-/// Returns the required Java major version (8, 17, or 21) for a given Minecraft version.
+/// Returns the required Java major version (8, 17, 21, or 25) for a given Minecraft version.
 pub fn required_java_version(mc_version: &str) -> u32 {
     let parts: Vec<u32> = mc_version
         .split('.')
         .filter_map(|p| p.parse::<u32>().ok())
         .collect();
+    let major = parts.first().copied().unwrap_or(1);
+    if major >= 26 {
+        return 25;
+    }
+
     let minor = parts.get(1).copied().unwrap_or(21);
     let patch = parts.get(2).copied().unwrap_or(0);
 
@@ -124,17 +129,22 @@ pub fn detect_installed_java(cache_dir: Option<&Path>) -> Vec<JavaRuntime> {
 
     #[cfg(target_os = "windows")]
     {
-        for base in [
-            r"C:\Program Files\Eclipse Adoptium",
-            r"C:\Program Files\Java",
-            r"C:\Program Files\Microsoft",
-            r"C:\Program Files\Zulu",
-        ] {
-            if let Ok(entries) = std::fs::read_dir(base) {
-                for entry in entries.flatten() {
-                    candidates.push(entry.path().join("bin").join(exe_name));
-                }
-            }
+        let mut bases: Vec<PathBuf> = vec![
+            PathBuf::from(r"C:\Program Files\Eclipse Adoptium"),
+            PathBuf::from(r"C:\Program Files\Java"),
+            PathBuf::from(r"C:\Program Files\Microsoft"),
+            PathBuf::from(r"C:\Program Files\Zulu"),
+        ];
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            bases.push(
+                PathBuf::from(appdata)
+                    .join("ModrinthApp")
+                    .join("meta")
+                    .join("java_versions"),
+            );
+        }
+        for base in bases {
+            collect_java_candidates_in_dir(&base, &mut candidates);
         }
     }
 
@@ -247,6 +257,19 @@ fn adoptium_os() -> &'static str {
     }
 }
 
+fn collect_java_candidates_in_dir(base: &Path, candidates: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(exe) = find_java_exe_under(&p) {
+                    candidates.push(exe);
+                }
+            }
+        }
+    }
+}
+
 fn find_java_exe_under(dir: &Path) -> Option<PathBuf> {
     let exe_name = java_exe_name();
     let direct = dir.join("bin").join(exe_name);
@@ -332,6 +355,7 @@ mod tests {
         assert_eq!(required_java_version("1.20.4"), 17);
         assert_eq!(required_java_version("1.20.5"), 21);
         assert_eq!(required_java_version("1.21.4"), 21);
+        assert_eq!(required_java_version("26.1.1"), 25);
     }
 
     #[test]
@@ -380,5 +404,28 @@ mod tests {
             runtime_install_dir(cache, 21),
             PathBuf::from("C:/deming/cache/runtimes/java-21")
         );
+    }
+
+    #[test]
+    fn collects_modrinth_style_java_versions_dir() {
+        let temp = std::env::temp_dir().join(format!(
+            "deming-java-scan-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = temp
+            .join("zulu25.32.21-ca-jre25.0.2-win_x64")
+            .join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_java = bin_dir.join(java_exe_name());
+        std::fs::write(&fake_java, b"").unwrap();
+
+        let mut found = Vec::new();
+        collect_java_candidates_in_dir(&temp, &mut found);
+        assert_eq!(found, vec![fake_java]);
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

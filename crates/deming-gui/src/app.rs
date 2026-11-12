@@ -213,6 +213,29 @@ impl DemingApp {
                         }
                     }
                 }
+                BridgeMessage::MsaBrowserLoginFinished(res) => {
+                    self.state.accounts.browser_login_in_flight = false;
+                    match res {
+                        Ok(session) => {
+                            self.state.accounts.browser_code_input.clear();
+                            self.state.accounts.browser_is_error = false;
+                            self.state.accounts.browser_status_msg = Some(format!(
+                                "Signed in as {} ({})",
+                                session.username, session.uuid
+                            ));
+                            views::accounts::refresh_accounts(&mut self.state);
+                            self.state.toast = Some(StatusToast {
+                                is_error: false,
+                                text: format!("Signed in with Microsoft as {}", session.username),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        Err(err) => {
+                            self.state.accounts.browser_is_error = true;
+                            self.state.accounts.browser_status_msg = Some(err);
+                        }
+                    }
+                }
             }
         }
     }

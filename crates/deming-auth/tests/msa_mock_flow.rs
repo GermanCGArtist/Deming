@@ -39,6 +39,32 @@ async fn spawn_mock_auth_server() -> (String, Arc<AtomicUsize>) {
                 let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
 
                 let (status, resp_body) = match (method, path) {
+                    ("POST", "/oauth20_token.srf") => {
+                        if body_str.contains("grant_type=refresh_token") {
+                            assert!(body_str.contains("refresh_token=live-refresh-1"));
+                            (
+                                "200 OK",
+                                json!({
+                                    "access_token": "msa-access-refreshed",
+                                    "refresh_token": "live-refresh-2",
+                                    "expires_in": 3600
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            assert!(body_str.contains("grant_type=authorization_code"));
+                            assert!(body_str.contains("code=M.R3_BAY.browser-code-1"));
+                            (
+                                "200 OK",
+                                json!({
+                                    "access_token": "msa-access-1",
+                                    "refresh_token": "live-refresh-1",
+                                    "expires_in": 3600
+                                })
+                                .to_string(),
+                            )
+                        }
+                    }
                     ("POST", "/oauth2/v2.0/devicecode") => {
                         assert!(body_str.contains("client_id=test-client-id"));
                         (
@@ -210,4 +236,31 @@ async fn full_device_code_and_refresh_flow_against_mock_server() {
     assert_eq!(refreshed.uuid, "853c80ef-3c37-49fd-aa49-938b674adae6");
 
     let _ = std::fs::remove_file(&store_path);
+}
+
+#[tokio::test]
+async fn browser_oauth_login_and_live_refresh_against_mock_server() {
+    let (base_url, _) = spawn_mock_auth_server().await;
+    let client = MsaClient::with_endpoints(
+        deming_auth::msa::MOJANG_CLIENT_ID,
+        MsaEndpoints::from_mock_base(&base_url),
+    );
+
+    let session = client
+        .complete_browser_login(
+            "https://login.live.com/oauth20_desktop.srf?code=M.R3_BAY.browser-code-1&lc=1033",
+        )
+        .await
+        .expect("complete_browser_login");
+    assert_eq!(session.uuid, "853c80ef-3c37-49fd-aa49-938b674adae6");
+    assert_eq!(session.username, "jeb_");
+    assert_eq!(session.mc_access_token, "mc-jwt-token-final");
+    assert_eq!(session.msa_refresh_token, "live-refresh-1");
+
+    let refreshed = client
+        .refresh_token(&session.msa_refresh_token)
+        .await
+        .expect("live refresh_token");
+    assert_eq!(refreshed.msa_refresh_token, "live-refresh-2");
+    assert_eq!(refreshed.mc_access_token, "mc-jwt-token-final");
 }

@@ -1,10 +1,10 @@
-//! Accounts tab: manage Offline/Dev accounts and Microsoft OAuth Device-Code login.
+//! Accounts tab: manage Offline/Dev accounts and Microsoft OAuth login.
 
 use chrono::Utc;
-use deming_auth::{create_offline_account, AccountStore, StoredAccount};
+use deming_auth::{create_offline_account, AccountStore, MsaClient, StoredAccount};
 use egui::{RichText, ScrollArea};
 
-use crate::runner_bridge::GuiBridge;
+use crate::runner_bridge::{GuiBridge, DEFAULT_MSA_CLIENT_ID};
 use crate::state::{StatusToast, UiState};
 use crate::theme::{
     card_frame, danger_button, primary_button, status_badge, sub_card_frame, ACCENT_EMERALD,
@@ -27,188 +27,308 @@ pub fn refresh_accounts(state: &mut UiState) {
 
 pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
     ui.columns(2, |cols| {
-        // Left column: Add Offline Account + Microsoft Device-Code Flow
+        // Left column: Add Offline Account + Microsoft OAuth Login
         card_frame().show(&mut cols[0], |ui| {
-            ui.label(
-                RichText::new("Add Offline / Dev Account")
-                    .size(15.5)
-                    .strong()
-                    .color(ACCENT_EMERALD),
-            );
-            ui.label(
-                RichText::new("Deterministic UUID v3 for online-mode=false local test servers.")
-                    .size(11.5)
-                    .color(TEXT_MUTED),
-            );
-            ui.add_space(6.0);
+            ScrollArea::vertical()
+                .id_salt("accounts_left_scroll")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Add Offline / Dev Account")
+                            .size(15.5)
+                            .strong()
+                            .color(ACCENT_EMERALD),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Deterministic UUID v3 for online-mode=false local test servers.",
+                        )
+                        .size(11.5)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.accounts.offline_username)
-                        .desired_width(200.0)
-                        .hint_text("Username (1-16 chars, A-Z, 0-9, _)"),
-                );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.accounts.offline_username)
+                                .desired_width(200.0)
+                                .hint_text("Username (1-16 chars, A-Z, 0-9, _)"),
+                        );
 
-                if ui.add(primary_button("Add Offline Account")).clicked() {
-                    match create_offline_account(state.accounts.offline_username.clone()) {
-                        Ok(acct) => {
-                            let store = AccountStore::from_config(&state.config);
-                            match store.upsert(StoredAccount::from_offline(&acct)) {
-                                Ok(()) => {
-                                    state.accounts.offline_username.clear();
-                                    refresh_accounts(state);
-                                    state.toast = Some(StatusToast {
-                                        is_error: false,
-                                        text: format!(
-                                            "Added offline account '{}' ({})",
-                                            acct.username,
-                                            acct.uuid_hyphenated()
-                                        ),
-                                        created_at: Utc::now(),
-                                    });
+                        if ui.add(primary_button("Add Offline Account")).clicked() {
+                            match create_offline_account(state.accounts.offline_username.clone()) {
+                                Ok(acct) => {
+                                    let store = AccountStore::from_config(&state.config);
+                                    match store.upsert(StoredAccount::from_offline(&acct)) {
+                                        Ok(()) => {
+                                            state.accounts.offline_username.clear();
+                                            refresh_accounts(state);
+                                            state.toast = Some(StatusToast {
+                                                is_error: false,
+                                                text: format!(
+                                                    "Added offline account '{}' ({})",
+                                                    acct.username,
+                                                    acct.uuid_hyphenated()
+                                                ),
+                                                created_at: Utc::now(),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            state.toast = Some(StatusToast {
+                                                is_error: true,
+                                                text: format!("Failed to save account: {e}"),
+                                                created_at: Utc::now(),
+                                            });
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     state.toast = Some(StatusToast {
                                         is_error: true,
-                                        text: format!("Failed to save account: {e}"),
+                                        text: e.to_string(),
                                         created_at: Utc::now(),
                                     });
                                 }
                             }
                         }
-                        Err(e) => {
-                            state.toast = Some(StatusToast {
-                                is_error: true,
-                                text: e.to_string(),
-                                created_at: Utc::now(),
-                            });
-                        }
-                    }
-                }
-            });
+                    });
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(12.0);
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(12.0);
 
-            // Microsoft OAuth Device-Code Flow
-            ui.label(
-                RichText::new("Microsoft Account (OAuth Device-Code)")
-                    .size(15.5)
-                    .strong()
-                    .color(ACCENT_EMERALD),
-            );
-            ui.label(
-                RichText::new(
-                    "Authenticate a licensed Minecraft account for online-mode=true tests.",
-                )
-                .size(11.5)
-                .color(TEXT_MUTED),
-            );
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Client ID:").color(TEXT_MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.accounts.msa_client_id)
-                        .desired_width(240.0),
-                );
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let start_enabled = !state.accounts.msa_polling
-                    && !state.accounts.msa_client_id.trim().is_empty();
-                if ui
-                    .add_enabled(
-                        start_enabled,
-                        primary_button("Sign in with Microsoft"),
-                    )
-                    .clicked()
-                {
-                    state.accounts.msa_polling = true;
-                    state.accounts.msa_prompt = None;
-                    state.accounts.msa_is_error = false;
-                    state.accounts.msa_status_msg =
-                        Some("Requesting device code from Microsoft...".to_string());
-                    bridge.start_msa_login(
-                        state.config.clone(),
-                        state.accounts.msa_client_id.trim().to_string(),
-                    );
-                }
-
-                if state.accounts.msa_polling && ui.button("Cancel Login").clicked() {
-                    bridge.cancel_msa_login();
-                    state.accounts.msa_polling = false;
-                    state.accounts.msa_prompt = None;
-                    state.accounts.msa_status_msg = Some("Cancelled".to_string());
-                }
-            });
-
-            if let Some(ref prompt) = state.accounts.msa_prompt {
-                ui.add_space(10.0);
-                sub_card_frame().show(ui, |ui| {
+                    // Primary Microsoft Browser Login (login.live.com)
                     ui.label(
-                        RichText::new("Enter this code in your browser:")
+                        RichText::new("Microsoft Account — Browser Login (Recommended)")
+                            .size(15.5)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(ACCENT_EMERALD),
                     );
-                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Uses default Mojang Client ID ({DEFAULT_MSA_CLIENT_ID}) — no Azure App Registration needed."
+                        ))
+                        .size(11.5)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        RichText::new(
+                            "1. Open Microsoft login in your browser and sign in.\n\
+                             2. After reaching the blank page, copy the full URL from your address bar (or the ?code= value) and paste it below.",
+                        )
+                        .size(11.5)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&prompt.user_code)
-                                .monospace()
-                                .size(22.0)
-                                .strong()
-                                .color(ACCENT_EMERALD),
+                        let auth_url =
+                            MsaClient::new(DEFAULT_MSA_CLIENT_ID).browser_authorize_url();
+                        if ui
+                            .add(primary_button("Open Microsoft Login in Browser"))
+                            .clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(auth_url.clone()));
+                            state.accounts.browser_is_error = false;
+                            state.accounts.browser_status_msg = Some(
+                                "Browser opened. Complete sign-in, then paste the redirect URL below."
+                                    .to_string(),
+                            );
+                        }
+                        if ui.button("Copy Login URL").clicked() {
+                            ui.ctx().copy_text(auth_url);
+                            state.toast = Some(StatusToast {
+                                is_error: false,
+                                text: "Copied Microsoft login URL".to_string(),
+                                created_at: Utc::now(),
+                            });
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.accounts.browser_code_input)
+                                .desired_width(260.0)
+                                .hint_text(
+                                    "https://login.live.com/oauth20_desktop.srf?code=... or code",
+                                ),
                         );
-                        if ui.button("Copy Code").clicked() {
-                            ui.ctx().copy_text(prompt.user_code.clone());
-                            state.toast = Some(StatusToast {
-                                is_error: false,
-                                text: format!("Copied user code '{}'", prompt.user_code),
-                                created_at: Utc::now(),
-                            });
+
+                        let can_complete = !state.accounts.browser_login_in_flight
+                            && !state.accounts.browser_code_input.trim().is_empty();
+                        if ui
+                            .add_enabled(can_complete, primary_button("Complete Sign-In"))
+                            .clicked()
+                        {
+                            state.accounts.browser_login_in_flight = true;
+                            state.accounts.browser_is_error = false;
+                            state.accounts.browser_status_msg = Some(
+                                "Exchanging authorization code with Microsoft / Xbox / Minecraft..."
+                                    .to_string(),
+                            );
+                            bridge.complete_browser_login(
+                                state.config.clone(),
+                                state.accounts.browser_code_input.trim().to_string(),
+                            );
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Verification URL:").color(TEXT_MUTED));
-                        ui.hyperlink_to(&prompt.verification_uri, &prompt.verification_uri);
-                        if ui.button("Copy URL").clicked() {
-                            ui.ctx().copy_text(prompt.verification_uri.clone());
-                            state.toast = Some(StatusToast {
-                                is_error: false,
-                                text: "Copied verification URL".to_string(),
-                                created_at: Utc::now(),
-                            });
-                        }
-                    });
-                    if state.accounts.msa_polling {
+
+                    if state.accounts.browser_login_in_flight {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(
-                                RichText::new("Waiting for Microsoft authorization...")
-                                    .color(INFO_BLUE),
+                                RichText::new("Completing Microsoft sign-in...").color(INFO_BLUE),
                             );
                         });
                     }
-                });
-            }
 
-            if let Some(ref status) = state.accounts.msa_status_msg {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(status)
-                        .size(12.0)
-                        .color(if state.accounts.msa_is_error {
-                            DANGER_RED
-                        } else {
-                            TEXT_MUTED
-                        }),
-                );
-            }
+                    if let Some(ref status) = state.accounts.browser_status_msg {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(status)
+                                .size(12.0)
+                                .color(if state.accounts.browser_is_error {
+                                    DANGER_RED
+                                } else {
+                                    TEXT_MUTED
+                                }),
+                        );
+                    }
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // Secondary collapsible Device-Code Flow
+                    egui::CollapsingHeader::new(
+                        RichText::new("Device-Code Login (Custom Azure Client ID)")
+                            .size(13.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Use this if you have registered your own Azure AD Public Client Application ID.",
+                            )
+                            .size(11.5)
+                            .color(TEXT_MUTED),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Client ID:").color(TEXT_MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.accounts.msa_client_id)
+                                    .desired_width(240.0),
+                            );
+                        });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let start_enabled = !state.accounts.msa_polling
+                                && !state.accounts.msa_client_id.trim().is_empty();
+                            if ui
+                                .add_enabled(
+                                    start_enabled,
+                                    primary_button("Start Device-Code Login"),
+                                )
+                                .clicked()
+                            {
+                                state.accounts.msa_polling = true;
+                                state.accounts.msa_prompt = None;
+                                state.accounts.msa_is_error = false;
+                                state.accounts.msa_status_msg =
+                                    Some("Requesting device code from Microsoft...".to_string());
+                                bridge.start_msa_login(
+                                    state.config.clone(),
+                                    state.accounts.msa_client_id.trim().to_string(),
+                                );
+                            }
+
+                            if state.accounts.msa_polling && ui.button("Cancel Login").clicked() {
+                                bridge.cancel_msa_login();
+                                state.accounts.msa_polling = false;
+                                state.accounts.msa_prompt = None;
+                                state.accounts.msa_status_msg = Some("Cancelled".to_string());
+                            }
+                        });
+
+                        if let Some(ref prompt) = state.accounts.msa_prompt {
+                            ui.add_space(10.0);
+                            sub_card_frame().show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Enter this code in your browser:")
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(&prompt.user_code)
+                                            .monospace()
+                                            .size(22.0)
+                                            .strong()
+                                            .color(ACCENT_EMERALD),
+                                    );
+                                    if ui.button("Copy Code").clicked() {
+                                        ui.ctx().copy_text(prompt.user_code.clone());
+                                        state.toast = Some(StatusToast {
+                                            is_error: false,
+                                            text: format!("Copied user code '{}'", prompt.user_code),
+                                            created_at: Utc::now(),
+                                        });
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Verification URL:").color(TEXT_MUTED));
+                                    ui.hyperlink_to(
+                                        &prompt.verification_uri,
+                                        &prompt.verification_uri,
+                                    );
+                                    if ui.button("Copy URL").clicked() {
+                                        ui.ctx().copy_text(prompt.verification_uri.clone());
+                                        state.toast = Some(StatusToast {
+                                            is_error: false,
+                                            text: "Copied verification URL".to_string(),
+                                            created_at: Utc::now(),
+                                        });
+                                    }
+                                });
+                                if state.accounts.msa_polling {
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new(
+                                                "Waiting for Microsoft authorization...",
+                                            )
+                                            .color(INFO_BLUE),
+                                        );
+                                    });
+                                }
+                            });
+                        }
+
+                        if let Some(ref status) = state.accounts.msa_status_msg {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(status)
+                                    .size(12.0)
+                                    .color(if state.accounts.msa_is_error {
+                                        DANGER_RED
+                                    } else {
+                                        TEXT_MUTED
+                                    }),
+                            );
+                        }
+                    });
+                });
         });
 
         // Right column: Stored Accounts List
