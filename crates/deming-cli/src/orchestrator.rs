@@ -16,7 +16,7 @@ use deming_fetch::{
     ensure_java_runtime, required_java_version, resolve_and_install_loader, resolve_mods,
     LoaderSide, ModrinthClient,
 };
-use deming_ipc::{IpcClient, IpcMessage};
+use deming_ipc::{IpcClient, IpcMessage, IpcServer};
 use deming_runner::{
     evaluate_rule, index_screenshots, run_client, AbortHandle, ClientLaunchConfig,
     EvaluationContext, ResourceScheduler, ServerLaunchConfig, ServerProcess,
@@ -36,6 +36,69 @@ pub fn default_config_path() -> PathBuf {
         .join("config.json")
 }
 
+/// Executes [`execute_job`] while ensuring an IPC endpoint is active in `config.workspace_dir`.
+///
+/// If no GUI [`IpcServer`] is already running, binds a temporary [`IpcServer`] for the duration
+/// of the job so `deming run abort` or MCP `abort_run` can abort CLI-launched runs.
+pub async fn execute_job_with_ipc(
+    config: &DemingConfig,
+    job: &TestJobSpec,
+    abort: Arc<AbortHandle>,
+) -> Result<RunManifest> {
+    let mut abs_ws = config.workspace_dir.clone();
+    if abs_ws.is_relative() {
+        abs_ws = std::env::current_dir()
+            .context("failed to determine current working directory")?
+            .join(&abs_ws);
+    }
+
+    let existing_client = IpcClient::connect(&abs_ws).await.ok();
+    let has_existing_server = existing_client.as_ref().is_some_and(|c| c.is_connected());
+
+    let mut local_server_task = None;
+    let mut local_server_stop = None;
+    let mut active_client = existing_client;
+
+    if !has_existing_server {
+        if let Ok(mut server) = IpcServer::bind(&abs_ws).await {
+            let port = server.local_addr().port();
+            active_client = IpcClient::connect_to_port(port).await.ok();
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let abort_clone = Arc::clone(&abort);
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        msg = server.recv() => {
+                            match msg {
+                                Some(IpcMessage::AbortAll) | Some(IpcMessage::AbortRun { .. }) => {
+                                    let _ = abort_clone.abort();
+                                }
+                                None => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                server.stop().await;
+            });
+            local_server_task = Some(task);
+            local_server_stop = Some(stop_tx);
+        }
+    }
+
+    let result = execute_job(config, job, abort, active_client.as_ref()).await;
+
+    if let Some(tx) = local_server_stop {
+        let _ = tx.send(());
+    }
+    if let Some(task) = local_server_task {
+        let _ = task.await;
+    }
+
+    result
+}
+
 /// Executes a [`TestJobSpec`] end-to-end:
 /// 1. Initializes [`RunArchiveWriter`] and emits `RunStarted` via IPC & archive.
 /// 2. Resolves Java runtimes, Mojang/Loader launch profiles, and mods for server & instances.
@@ -52,6 +115,14 @@ pub async fn execute_job(
     abort: Arc<AbortHandle>,
     ipc: Option<&IpcClient>,
 ) -> Result<RunManifest> {
+    let mut abs_config = config.clone();
+    if abs_config.workspace_dir.is_relative() {
+        abs_config.workspace_dir = std::env::current_dir()
+            .context("failed to determine current working directory")?
+            .join(&abs_config.workspace_dir);
+    }
+    let config = &abs_config;
+
     let run_id = Uuid::new_v4();
     let created_at = Utc::now();
 
@@ -157,108 +228,141 @@ pub async fn execute_job(
         })
     });
 
-    // Resolve mods client once for server + all instances.
-    let modrinth = ModrinthClient::new().context("failed to initialize ModrinthClient")?;
     let account_store = AccountStore::from_config(config);
 
-    // 2 & 4. Resolve & start optional dedicated server.
-    let mut server_process: Option<ServerProcess> = None;
-    let mut connect_target: Option<(String, u16)> = None;
+    // 2 & 4. Resolve mods client & optional dedicated server.
+    let prep_result: Result<(ModrinthClient, Option<ServerProcess>, Option<(String, u16)>)> = async {
+        let modrinth = ModrinthClient::new().context("failed to initialize ModrinthClient")?;
+        let mut server_process: Option<ServerProcess> = None;
+        let mut connect_target: Option<(String, u16)> = None;
 
-    if let Some(server_spec) = &job.server {
-        let server_dir = config.servers_dir().join(run_id.to_string());
-        tokio::fs::create_dir_all(&server_dir).await?;
+        if let Some(server_spec) = &job.server {
+            let server_dir = config.servers_dir().join(run_id.to_string());
+            tokio::fs::create_dir_all(&server_dir).await?;
 
-        let java_ver = required_java_version(&server_spec.mc_version);
-        let java = ensure_java_runtime(&config.cache_dir(), java_ver)
+            let java_ver = required_java_version(&server_spec.mc_version);
+            let java = ensure_java_runtime(&config.cache_dir(), java_ver)
+                .await
+                .context("failed to provision Java runtime for server")?;
+
+            let profile = resolve_and_install_loader(
+                config,
+                &server_spec.mc_version,
+                server_spec.loader,
+                server_spec.loader_version.as_deref(),
+                LoaderSide::Server,
+                &server_dir,
+                Some(&java.executable),
+            )
             .await
-            .context("failed to provision Java runtime for server")?;
+            .context("failed to resolve/install server loader")?;
 
-        let profile = resolve_and_install_loader(
-            config,
-            &server_spec.mc_version,
-            server_spec.loader,
-            server_spec.loader_version.as_deref(),
-            LoaderSide::Server,
-            &server_dir,
-            Some(&java.executable),
-        )
-        .await
-        .context("failed to resolve/install server loader")?;
-
-        resolve_mods(
-            &modrinth,
-            &server_spec.mods,
-            &server_spec.mc_version,
-            server_spec.loader,
-            &config.cache_dir(),
-            &server_dir.join("mods"),
-        )
-        .await
-        .context("failed to resolve server mods")?;
-
-        let ram_mb = server_spec
-            .ram_mb
-            .unwrap_or(config.global_limits.default_instance_ram_mb);
-
-        let (jvm_args, program_args) = if profile.server_jar.is_some() {
-            let mut prog = profile.game_args.clone();
-            if !prog.iter().any(|a| a == "nogui") {
-                prog.push("nogui".to_string());
-            }
-            (profile.jvm_args.clone(), prog)
-        } else {
-            let mut jvm = Vec::new();
-            if ram_mb > 0 {
-                let xms = ram_mb.min(512).max(128.min(ram_mb));
-                jvm.push(format!("-Xms{xms}M"));
-                jvm.push(format!("-Xmx{ram_mb}M"));
-            }
-            jvm.extend(profile.jvm_args.iter().cloned());
-            if !profile.classpath.is_empty() {
-                let sep = if cfg!(windows) { ";" } else { ":" };
-                let cp = profile
-                    .classpath
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(sep);
-                jvm.push("-cp".to_string());
-                jvm.push(cp);
-            }
-            let mut prog = Vec::new();
-            if !profile.main_class.is_empty() {
-                prog.push(profile.main_class.clone());
-            }
-            prog.extend(profile.game_args.iter().cloned());
-            if !prog.iter().any(|a| a == "nogui") {
-                prog.push("nogui".to_string());
-            }
-            (jvm, prog)
-        };
-
-        let server_cfg = ServerLaunchConfig {
-            run_id,
-            java_exe: java.executable,
-            server_dir,
-            server_jar: profile.server_jar,
-            jvm_args,
-            program_args,
-            spec: server_spec.clone(),
-            ram_mb,
-            cpu_cores: Some(config.global_limits.default_cpu_cores_per_instance),
-            priority: config.global_limits.process_priority,
-            startup_timeout_secs: job.timeout_secs.max(30),
-        };
-
-        let proc = ServerProcess::start(server_cfg, &abort, Some(event_tx.clone()))
+            resolve_mods(
+                &modrinth,
+                &server_spec.mods,
+                &server_spec.mc_version,
+                server_spec.loader,
+                &config.cache_dir(),
+                &server_dir.join("mods"),
+            )
             .await
-            .context("failed to start dedicated server")?;
-        let port = proc.port();
-        if server_spec.auto_connect_clients {
-            connect_target = Some(("127.0.0.1".to_string(), port));
+            .context("failed to resolve server mods")?;
+
+            let ram_mb = server_spec
+                .ram_mb
+                .unwrap_or(config.global_limits.default_instance_ram_mb);
+
+            let (jvm_args, program_args) = if profile.server_jar.is_some() {
+                let mut prog = profile.game_args.clone();
+                if !prog.iter().any(|a| a == "nogui") {
+                    prog.push("nogui".to_string());
+                }
+                (profile.jvm_args.clone(), prog)
+            } else {
+                let mut jvm = Vec::new();
+                if ram_mb > 0 {
+                    let xms = ram_mb.min(512).max(128.min(ram_mb));
+                    jvm.push(format!("-Xms{xms}M"));
+                    jvm.push(format!("-Xmx{ram_mb}M"));
+                }
+                jvm.extend(profile.jvm_args.iter().cloned());
+                if !profile.classpath.is_empty() {
+                    let sep = if cfg!(windows) { ";" } else { ":" };
+                    let cp = profile
+                        .classpath
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(sep);
+                    jvm.push("-cp".to_string());
+                    jvm.push(cp);
+                }
+                let mut prog = Vec::new();
+                if !profile.main_class.is_empty() {
+                    prog.push(profile.main_class.clone());
+                }
+                prog.extend(profile.game_args.iter().cloned());
+                if !prog.iter().any(|a| a == "nogui") {
+                    prog.push("nogui".to_string());
+                }
+                (jvm, prog)
+            };
+
+            let server_cfg = ServerLaunchConfig {
+                run_id,
+                java_exe: java.executable,
+                server_dir,
+                server_jar: profile.server_jar,
+                jvm_args,
+                program_args,
+                spec: server_spec.clone(),
+                ram_mb,
+                cpu_cores: Some(config.global_limits.default_cpu_cores_per_instance),
+                priority: config.global_limits.process_priority,
+                startup_timeout_secs: job.timeout_secs.max(30),
+            };
+
+            let proc = ServerProcess::start(server_cfg, &abort, Some(event_tx.clone()))
+                .await
+                .context("failed to start dedicated server")?;
+            let port = proc.port();
+            if server_spec.auto_connect_clients {
+                connect_target = Some(("127.0.0.1".to_string(), port));
+            }
+            server_process = Some(proc);
         }
-        server_process = Some(proc);
+
+        Ok((modrinth, server_process, connect_target))
+    }
+    .await;
+
+    let (modrinth, server_process, connect_target) = match prep_result {
+        Ok(vals) => vals,
+        Err(e) => {
+            let finished_at = Utc::now();
+            manifest.status = if abort.is_aborted() {
+                RunStatus::Aborted
+            } else {
+                RunStatus::Failed
+            };
+            manifest.finished_at = Some(finished_at);
+            let _ = event_tx.send(RunEvent::RunFinished {
+                run_id,
+                status: manifest.status,
+                timestamp: finished_at,
+            });
+            drop(event_tx);
+            let _ = event_task.await;
+            if let Some(listener) = ipc_listener_task {
+                listener.abort();
+            }
+            let writer = archive.lock().await;
+            let _ = writer.write_manifest(&manifest);
+            return Err(e);
+        }
+    };
+
+    if server_process.is_some() {
         manifest.server_log_path = Some(PathBuf::from("server").join("latest.log"));
     }
 
@@ -481,8 +585,8 @@ async fn run_single_instance(
         priority: config.global_limits.process_priority,
         connect_server,
         timeout_secs,
-        extra_jvm_args: profile.jvm_args,
-        extra_game_args: profile.game_args,
+        extra_jvm_args: strip_unexpanded_mojang_args(&profile.jvm_args),
+        extra_game_args: strip_unexpanded_mojang_args(&profile.game_args),
     };
 
     let outcome = match run_client(launch_cfg, &abort, Some(event_tx.clone())).await {
@@ -625,6 +729,29 @@ async fn resolve_account_token(
             }
         }
     }
+}
+
+fn strip_unexpanded_mojang_args(args: &[String]) -> Vec<String> {
+    let mut cleaned = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.contains("${") {
+            i += 1;
+            continue;
+        }
+        // Also drop `--flag ${placeholder}` or `-cp ${classpath}` pairs.
+        if (arg.starts_with('-') || arg.starts_with("--"))
+            && i + 1 < args.len()
+            && args[i + 1].contains("${")
+        {
+            i += 2;
+            continue;
+        }
+        cleaned.push(arg.clone());
+        i += 1;
+    }
+    cleaned
 }
 
 fn emit_instance_state(

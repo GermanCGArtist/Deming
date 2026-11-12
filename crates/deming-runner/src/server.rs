@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::scheduler::AbortHandle;
 use crate::win_job::{configure_tokio_child, JobHandle};
+use crate::{absolutize_executable, absolutize_path};
 
 /// Picks an available ephemeral TCP port on `127.0.0.1` by binding port `0`.
 pub fn pick_free_port() -> Result<u16> {
@@ -87,31 +88,55 @@ pub struct ServerLaunchConfig {
 }
 
 impl ServerLaunchConfig {
-    /// Builds the argument list passed to `java_exe`.
+    /// Builds the argument list passed to `java_exe`, resolving relative JAR/classpath paths
+    /// to absolute paths so `current_dir` in `server_dir` never breaks relative references.
     pub fn build_args(&self) -> Vec<String> {
         let mut args = Vec::new();
-        if self.server_jar.is_some() {
+        let resolved_jvm = absolutize_classpath_in_args(&self.jvm_args);
+        if let Some(jar) = &self.server_jar {
             if self.ram_mb > 0 {
                 let xms = self.ram_mb.min(512).max(128.min(self.ram_mb));
                 args.push(format!("-Xms{xms}M"));
                 args.push(format!("-Xmx{}M", self.ram_mb));
             }
-            args.extend(self.jvm_args.iter().cloned());
-            if let Some(jar) = &self.server_jar {
-                args.push("-jar".to_string());
-                args.push(jar.to_string_lossy().into_owned());
-            }
+            args.extend(resolved_jvm);
+            args.push("-jar".to_string());
+            args.push(absolutize_path(jar).to_string_lossy().into_owned());
             if self.program_args.is_empty() {
                 args.push("nogui".to_string());
             } else {
                 args.extend(self.program_args.iter().cloned());
             }
         } else {
-            args.extend(self.jvm_args.iter().cloned());
+            args.extend(resolved_jvm);
             args.extend(self.program_args.iter().cloned());
         }
         args
     }
+}
+
+fn absolutize_classpath_in_args(args: &[String]) -> Vec<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut out = Vec::with_capacity(args.len());
+    let mut next_is_cp = false;
+    for arg in args {
+        if next_is_cp {
+            next_is_cp = false;
+            let joined = arg
+                .split(sep)
+                .filter(|s| !s.is_empty())
+                .map(|entry| absolutize_path(Path::new(entry)).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(&sep.to_string());
+            out.push(joined);
+            continue;
+        }
+        if arg == "-cp" || arg == "-classpath" {
+            next_is_cp = true;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 /// Handle to a running dedicated server process contained inside a [`JobHandle`].
@@ -150,10 +175,13 @@ impl ServerProcess {
             _ => pick_free_port()?,
         };
 
-        fs::create_dir_all(&config.server_dir)?;
-        write_eula(&config.server_dir, true)?;
+        let server_dir = absolutize_path(&config.server_dir);
+        let java_exe = absolutize_executable(&config.java_exe);
+
+        fs::create_dir_all(&server_dir)?;
+        write_eula(&server_dir, true)?;
         write_server_properties(
-            &config.server_dir,
+            &server_dir,
             port,
             config.spec.online_mode,
             &config.spec.server_properties,
@@ -163,9 +191,9 @@ impl ServerProcess {
         abort.register_job(Arc::clone(&job))?;
 
         let args = config.build_args();
-        let mut cmd = Command::new(&config.java_exe);
+        let mut cmd = Command::new(&java_exe);
         cmd.args(&args)
-            .current_dir(&config.server_dir)
+            .current_dir(&server_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -380,5 +408,63 @@ impl ServerProcess {
             let _ = task.await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deming_core::ModLoader;
+
+    #[test]
+    fn server_build_args_absolutizes_relative_jar_and_classpath() {
+        let cfg_jar = ServerLaunchConfig {
+            run_id: Uuid::new_v4(),
+            java_exe: PathBuf::from(".deming-test/ws/cache/jre/bin/java.exe"),
+            server_dir: PathBuf::from(".deming-test/ws/servers/run1"),
+            server_jar: Some(PathBuf::from(".deming-test/ws/cache/loaders/fabric/server.jar")),
+            jvm_args: vec![],
+            program_args: vec![],
+            spec: ServerSpec {
+                mc_version: "1.20.1".to_string(),
+                loader: ModLoader::Fabric,
+                loader_version: None,
+                mods: vec![],
+                online_mode: false,
+                port: None,
+                server_properties: BTreeMap::new(),
+                ready_pattern: "Done".to_string(),
+                auto_connect_clients: true,
+                ram_mb: Some(1024),
+            },
+            ram_mb: 1024,
+            cpu_cores: None,
+            priority: ProcessPriority::Normal,
+            startup_timeout_secs: 30,
+        };
+
+        let jar_args = cfg_jar.build_args();
+        let jar_idx = jar_args.iter().position(|a| a == "-jar").unwrap();
+        assert!(
+            Path::new(&jar_args[jar_idx + 1]).is_absolute(),
+            "expected absolute -jar path, got {}",
+            jar_args[jar_idx + 1]
+        );
+        assert!(absolutize_executable(&cfg_jar.java_exe).is_absolute());
+
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let cfg_cp = ServerLaunchConfig {
+            server_jar: None,
+            jvm_args: vec![
+                "-cp".to_string(),
+                format!(".deming-test/ws/cache/a.jar{sep}.deming-test/ws/cache/b.jar"),
+            ],
+            ..cfg_jar
+        };
+        let cp_args = cfg_cp.build_args();
+        let cp_idx = cp_args.iter().position(|a| a == "-cp").unwrap();
+        for entry in cp_args[cp_idx + 1].split(sep.chars().next().unwrap()) {
+            assert!(Path::new(entry).is_absolute(), "expected absolute cp entry: {entry}");
+        }
     }
 }

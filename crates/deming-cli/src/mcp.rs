@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::orchestrator::execute_job;
+use crate::orchestrator::execute_job_with_ipc;
 
 /// JSON-RPC 2.0 MCP server backed by a Deming configuration file.
 #[derive(Debug, Clone)]
@@ -244,8 +244,7 @@ impl McpServer {
                 let job_val = args.get("job").cloned().unwrap_or(args);
                 let job: TestJobSpec = serde_json::from_value(job_val)?;
                 let abort = Arc::new(AbortHandle::new());
-                let ipc = IpcClient::connect(&cfg.workspace_dir).await.ok();
-                let manifest = execute_job(&cfg, &job, abort, ipc.as_ref()).await?;
+                let manifest = execute_job_with_ipc(&cfg, &job, abort).await?;
                 Ok(serde_json::to_value(manifest)?)
             }
             "get_run_status" => {

@@ -1,12 +1,28 @@
 //! Shared HTTP download, hash verification, and platform helpers.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use deming_core::{DemingError, Result};
 use futures_util::StreamExt;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
+
+static DOWNLOAD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn dest_lock(dest: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let map = DOWNLOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("download lock map poisoned");
+    guard
+        .entry(dest.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Builds a shared `reqwest::Client` with a Deming user-agent.
 pub fn build_http_client() -> Result<reqwest::Client> {
@@ -84,19 +100,11 @@ pub async fn download_file(
     expected_sha256: Option<&str>,
     skip_if_exists_without_hash: bool,
 ) -> Result<(String, String)> {
-    if dest.is_file() {
-        let sha1_ok = match expected_sha1 {
-            Some(exp) => verify_sha1(dest, exp)?,
-            None => true,
-        };
-        let sha256_ok = match expected_sha256 {
-            Some(exp) => verify_sha256(dest, exp)?,
-            None => true,
-        };
-        let has_hash = expected_sha1.is_some() || expected_sha256.is_some();
-        if (has_hash && sha1_ok && sha256_ok) || (!has_hash && skip_if_exists_without_hash) {
-            return Ok((compute_sha1(dest)?, compute_sha256(dest)?));
-        }
+    let lock = dest_lock(dest);
+    let _guard = lock.lock().await;
+
+    if is_existing_valid(dest, expected_sha1, expected_sha256, skip_if_exists_without_hash)? {
+        return Ok((compute_sha1(dest)?, compute_sha256(dest)?));
     }
 
     if let Some(parent) = dest.parent() {
@@ -124,12 +132,23 @@ pub async fn download_file(
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            DemingError::Network(format!("stream error downloading {url}: {e}"))
-        })?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(DemingError::Network(format!(
+                    "stream error downloading {url}: {e}"
+                )));
+            }
+        };
         sha1_hasher.update(&chunk);
         sha256_hasher.update(&chunk);
-        file.write_all(&chunk).await?;
+        if let Err(e) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
     }
     file.flush().await?;
     drop(file);
@@ -154,17 +173,42 @@ pub async fn download_file(
         }
     }
 
-    if dest.exists() {
-        let _ = tokio::fs::remove_file(dest).await;
+    if is_existing_valid(dest, expected_sha1, expected_sha256, skip_if_exists_without_hash)? {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok((compute_sha1(dest)?, compute_sha256(dest)?));
     }
+
     tokio::fs::rename(&tmp_path, dest).await?;
 
     Ok((actual_sha1, actual_sha256))
 }
 
+fn is_existing_valid(
+    dest: &Path,
+    expected_sha1: Option<&str>,
+    expected_sha256: Option<&str>,
+    skip_if_exists_without_hash: bool,
+) -> Result<bool> {
+    if !dest.is_file() {
+        return Ok(false);
+    }
+    let sha1_ok = match expected_sha1 {
+        Some(exp) => verify_sha1(dest, exp)?,
+        None => true,
+    };
+    let sha256_ok = match expected_sha256 {
+        Some(exp) => verify_sha256(dest, exp)?,
+        None => true,
+    };
+    let has_hash = expected_sha1.is_some() || expected_sha256.is_some();
+    Ok((has_hash && sha1_ok && sha256_ok) || (!has_hash && skip_if_exists_without_hash))
+}
+
 fn temp_part_path(dest: &Path) -> PathBuf {
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
     let mut os = dest.as_os_str().to_os_string();
-    os.push(".part");
+    os.push(format!(".{pid}.{seq}.part"));
     PathBuf::from(os)
 }
 
@@ -234,5 +278,69 @@ mod tests {
             Some("de/oceanlabs/mcp/mcp_config/1.21.4/mcp_config-1.21.4.zip".to_string())
         );
         assert_eq!(maven_coord_to_path("invalid"), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_download_file_to_same_destination() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let payload = b"deming-concurrent-download-payload";
+        let mut hasher = Sha1::new();
+        hasher.update(payload);
+        let expected_sha1 = hex::encode(hasher.finalize());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(payload).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let temp = std::env::temp_dir().join(format!(
+            "deming-fetch-concurrent-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = temp.join("shared-artifact.jar");
+        let url = format!("http://{addr}/shared-artifact.jar");
+        let client = build_http_client().unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let c = client.clone();
+            let u = url.clone();
+            let d = dest.clone();
+            let sha = expected_sha1.clone();
+            handles.push(tokio::spawn(async move {
+                download_file(&c, &u, &d, Some(&sha), None, false).await
+            }));
+        }
+
+        for h in handles {
+            let (sha1, _sha256) = h.await.unwrap().unwrap();
+            assert_eq!(sha1, expected_sha1);
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

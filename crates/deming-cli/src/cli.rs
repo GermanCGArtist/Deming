@@ -14,7 +14,7 @@ use deming_runner::AbortHandle;
 use serde_json::json;
 
 use crate::mcp;
-use crate::orchestrator::{default_config_path, execute_job, DEFAULT_MSA_CLIENT_ID};
+use crate::orchestrator::{default_config_path, execute_job_with_ipc, DEFAULT_MSA_CLIENT_ID};
 
 /// Deming: Pure Rust Minecraft Java Edition mod test orchestrator.
 #[derive(Debug, Parser)]
@@ -337,8 +337,14 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
                 .with_context(|| format!("invalid TestJobSpec JSON in {}", job_file.display()))?;
 
             let abort = Arc::new(AbortHandle::new());
-            let ipc = IpcClient::connect(&config.workspace_dir).await.ok();
-            let manifest = execute_job(config, &job, abort, ipc.as_ref()).await?;
+            let abort_for_sig = Arc::clone(&abort);
+            let sig_task = tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    let _ = abort_for_sig.abort();
+                }
+            });
+            let manifest = execute_job_with_ipc(config, &job, abort).await?;
+            sig_task.abort();
 
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
