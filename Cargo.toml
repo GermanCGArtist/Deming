@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/deming-core"]
+members = [
+    "crates/deming-core",
+    "crates/deming-fetch",
+    "crates/deming-auth",
+    "crates/deming-runner",
+    "crates/deming-archive",
+    "crates/deming-ipc",
+]
 
 [workspace.package]
 version = "0.1.0"
