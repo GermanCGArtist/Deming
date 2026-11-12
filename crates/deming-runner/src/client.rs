@@ -1,6 +1,6 @@
 //! Minecraft client JVM launch, auto-connect flags, stdout/stderr streaming, and timeout enforcement.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +45,8 @@ pub fn supports_quick_play(mc_version: &str) -> bool {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
 
-    (major, minor) >= (1, 20)
+    // Mojang switched to year-based major versions starting with 26.x (all >= 1.20).
+    major > 1 || (major == 1 && minor >= 20)
 }
 
 /// Builds the auto-connect game arguments for connecting to `host:port` based on `mc_version`.
@@ -260,6 +261,7 @@ pub async fn run_client(
     let java_exe = absolutize_executable(&config.java_exe);
 
     std::fs::create_dir_all(&instance_dir)?;
+    ensure_default_options_txt(&instance_dir)?;
 
     let job = Arc::new(JobHandle::new()?);
     abort.register_job(Arc::clone(&job))?;
@@ -436,6 +438,17 @@ pub async fn run_client(
         started_at,
         finished_at,
     })
+}
+
+/// Writes `<instance_dir>/options.txt` with `onboardAccessibility:false\n` if missing,
+/// so fresh test instances skip Minecraft's Accessibility Onboarding screen and allow
+/// `--quickPlayMultiplayer` to auto-connect immediately.
+pub fn ensure_default_options_txt(instance_dir: &Path) -> Result<()> {
+    let options_path = instance_dir.join("options.txt");
+    if !options_path.exists() {
+        std::fs::write(&options_path, "onboardAccessibility:false\n")?;
+    }
+    Ok(())
 }
 
 fn emit_state(
@@ -647,5 +660,28 @@ mod tests {
         // Relative executable with parent is absolutized; bare command is left intact.
         assert!(absolutize_executable(&cfg.java_exe).is_absolute());
         assert_eq!(absolutize_executable(Path::new("java")), PathBuf::from("java"));
+    }
+
+    #[test]
+    fn ensure_default_options_txt_skips_onboarding_only_when_missing() {
+        let dir = std::env::temp_dir().join(format!("deming-opts-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        ensure_default_options_txt(&dir).unwrap();
+        let options_path = dir.join("options.txt");
+        assert_eq!(
+            std::fs::read_to_string(&options_path).unwrap(),
+            "onboardAccessibility:false\n"
+        );
+
+        // Existing options.txt must be preserved untouched.
+        std::fs::write(&options_path, "lang:en_us\nonboardAccessibility:true\n").unwrap();
+        ensure_default_options_txt(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&options_path).unwrap(),
+            "lang:en_us\nonboardAccessibility:true\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

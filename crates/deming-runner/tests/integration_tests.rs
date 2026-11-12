@@ -247,6 +247,8 @@ fn client_auto_connect_flags_by_version() {
     assert!(supports_quick_play("1.21.4"));
     assert!(supports_quick_play("1.20-pre1"));
     assert!(supports_quick_play("23w14a"));
+    assert!(supports_quick_play("26.1"));
+    assert!(supports_quick_play("26.1.1"));
     assert!(!supports_quick_play("1.19.4"));
     assert!(!supports_quick_play("1.18.2"));
     assert!(!supports_quick_play("1.12.2"));
@@ -255,6 +257,10 @@ fn client_auto_connect_flags_by_version() {
     assert_eq!(
         build_connect_args("1.21.4", "127.0.0.1", 25565),
         vec!["--quickPlayMultiplayer", "127.0.0.1:25565"]
+    );
+    assert_eq!(
+        build_connect_args("26.1.1", "127.0.0.1", 52082),
+        vec!["--quickPlayMultiplayer", "127.0.0.1:52082"]
     );
     assert_eq!(
         build_connect_args("1.19.4", "127.0.0.1", 25565),
