@@ -1,0 +1,32 @@
+[package]
+name = "deming-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "CLI, job orchestrator, and stdio MCP server for Deming"
+
+[[bin]]
+name = "deming"
+path = "src/main.rs"
+
+[lib]
+name = "deming_cli"
+path = "src/lib.rs"
+
+[dependencies]
+deming-core = { path = "../deming-core" }
+deming-fetch = { path = "../deming-fetch" }
+deming-auth = { path = "../deming-auth" }
+deming-runner = { path = "../deming-runner" }
+deming-archive = { path = "../deming-archive" }
+deming-ipc = { path = "../deming-ipc" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+

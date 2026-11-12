@@ -7,6 +7,8 @@ members = [
     "crates/deming-runner",
     "crates/deming-archive",
     "crates/deming-ipc",
+    "crates/deming-cli",
+    "crates/deming-gui",
 ]
 
 [workspace.package]
