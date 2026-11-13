@@ -14,9 +14,9 @@ regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
-image = "0.25"
 
 [target.'cfg(windows)'.dependencies]
+image = "0.25"
 windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",

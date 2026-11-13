@@ -288,11 +288,10 @@ fn capture_hwnd_rgba(
     Ok((width as u32, height as u32, rgba_bytes))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn find_and_capture_return_gracefully_for_nonexistent_pid() {
         // PID u32::MAX - 1 will not match any running window.
