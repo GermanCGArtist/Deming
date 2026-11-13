@@ -298,6 +298,7 @@ fn adoptium_os() -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn collect_java_candidates_in_dir(base: &Path, candidates: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(base) {
         for entry in entries.flatten() {
