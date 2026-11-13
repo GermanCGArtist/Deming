@@ -46,6 +46,27 @@ impl ActiveTab {
     }
 }
 
+/// Incremental progress reported via [`RunEvent::Progress`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressInfo {
+    pub phase: String,
+    pub completed: u64,
+    pub total: u64,
+    pub message: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ProgressInfo {
+    /// Returns progress fraction in `0.0..=1.0`.
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.completed as f32 / self.total as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Live state of an individual instance inside an active/recent run card.
 #[derive(Debug, Clone)]
 pub struct LiveInstanceState {
@@ -55,6 +76,9 @@ pub struct LiveInstanceState {
     pub ram_mb: u64,
     pub cpu_cores: usize,
     pub pid: Option<u32>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub progress: Option<ProgressInfo>,
     pub logs: Vec<String>,
     pub screenshots: Vec<PathBuf>,
     pub passed: Option<bool>,
@@ -68,9 +92,11 @@ pub struct LiveRunCard {
     pub job_name: String,
     pub source_label: String,
     pub status: RunStatus,
+    pub timeout_secs: u64,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub server_port: Option<u16>,
+    pub server_progress: Option<ProgressInfo>,
     pub server_logs: Vec<String>,
     pub instances: Vec<LiveInstanceState>,
 }
@@ -96,6 +122,9 @@ impl LiveRunCard {
                     .cpu_cores
                     .unwrap_or(config.global_limits.default_cpu_cores_per_instance),
                 pid: None,
+                started_at: None,
+                finished_at: None,
+                progress: None,
                 logs: Vec::new(),
                 screenshots: Vec::new(),
                 passed: None,
@@ -108,9 +137,11 @@ impl LiveRunCard {
             job_name,
             source_label: "Local GUI".to_string(),
             status: RunStatus::Running,
+            timeout_secs: spec.timeout_secs,
             started_at: Utc::now(),
             finished_at: None,
             server_port: None,
+            server_progress: None,
             server_logs: Vec::new(),
             instances,
         }
@@ -122,12 +153,33 @@ impl LiveRunCard {
             job_name,
             source_label: "IPC (CLI / MCP)".to_string(),
             status: RunStatus::Running,
+            timeout_secs: 0,
             started_at: Utc::now(),
             finished_at: None,
             server_port: None,
+            server_progress: None,
             server_logs: Vec::new(),
             instances: Vec::new(),
         }
+    }
+
+    /// Returns `(finished_count, total_count)` across instances in this run.
+    pub fn completion_counts(&self) -> (usize, usize) {
+        let total = self.instances.len();
+        let finished = self
+            .instances
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.state,
+                    InstanceState::Passed
+                        | InstanceState::Failed
+                        | InstanceState::Aborted
+                        | InstanceState::TimedOut
+                )
+            })
+            .count();
+        (finished, total)
     }
 
     /// Applies an incoming [`RunEvent`] to update the live card state.
@@ -146,15 +198,29 @@ impl LiveRunCard {
             }
             RunEvent::ServerReady { port, .. } => {
                 self.server_port = Some(*port);
+                self.server_progress = None;
             }
             RunEvent::InstanceStateChanged {
                 instance_id,
                 state,
                 message,
+                timestamp,
                 ..
             } => {
                 let inst = self.ensure_instance(instance_id, defaults);
                 inst.state = *state;
+                if *state == InstanceState::Running && inst.started_at.is_none() {
+                    inst.started_at = Some(*timestamp);
+                }
+                if matches!(
+                    state,
+                    InstanceState::Passed
+                        | InstanceState::Failed
+                        | InstanceState::Aborted
+                        | InstanceState::TimedOut
+                ) {
+                    inst.finished_at = Some(*timestamp);
+                }
                 if let Some(msg) = message {
                     inst.status_message = Some(msg.clone());
                     if let Some(pid) = parse_pid_from_message(msg) {
@@ -188,6 +254,29 @@ impl LiveRunCard {
                 inst.passed = Some(*passed);
                 inst.reason = Some(reason.clone());
             }
+            RunEvent::Progress {
+                timestamp,
+                instance_id,
+                phase,
+                completed,
+                total,
+                message,
+                ..
+            } => {
+                let info = ProgressInfo {
+                    phase: phase.clone(),
+                    completed: *completed,
+                    total: *total,
+                    message: message.clone(),
+                    updated_at: *timestamp,
+                };
+                if let Some(inst_id) = instance_id {
+                    let inst = self.ensure_instance(inst_id, defaults);
+                    inst.progress = Some(info);
+                } else {
+                    self.server_progress = Some(info);
+                }
+            }
             RunEvent::RunFinished {
                 status, timestamp, ..
             } => {
@@ -216,6 +305,9 @@ impl LiveRunCard {
             ram_mb: defaults.default_instance_ram_mb,
             cpu_cores: defaults.default_cpu_cores_per_instance,
             pid: None,
+            started_at: None,
+            finished_at: None,
+            progress: None,
             logs: Vec::new(),
             screenshots: Vec::new(),
             passed: None,
@@ -235,12 +327,14 @@ fn push_bounded(buf: &mut Vec<String>, line: String) {
 }
 
 /// State for the Dashboard tab.
-#[derive(Debug, Clone)]
 pub struct DashboardState {
     pub runs: Vec<LiveRunCard>,
     pub selected_log_target: Option<(String, String)>,
     pub log_filter: String,
     pub auto_scroll_logs: bool,
+    pub show_live_renders: bool,
+    pub live_renders_grid: bool,
+    pub live_frame_textures: HashMap<(String, String), egui::TextureHandle>,
 }
 
 impl Default for DashboardState {
@@ -250,7 +344,51 @@ impl Default for DashboardState {
             selected_log_target: None,
             log_filter: String::new(),
             auto_scroll_logs: true,
+            show_live_renders: true,
+            live_renders_grid: false,
+            live_frame_textures: HashMap::new(),
         }
+    }
+}
+
+impl DashboardState {
+    /// Creates or updates the [`egui::TextureHandle`] for a live cloaked instance render.
+    ///
+    /// Returns `false` if the dimensions/buffer length are invalid.
+    pub fn apply_live_frame(
+        &mut self,
+        ctx: &egui::Context,
+        run_id: &str,
+        instance_id: &str,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> bool {
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if width == 0 || height == 0 || rgba.len() != expected {
+            return false;
+        }
+        let color_img =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba);
+        let key = (run_id.to_string(), instance_id.to_string());
+        if let Some(handle) = self.live_frame_textures.get_mut(&key) {
+            handle.set(color_img, egui::TextureOptions::LINEAR);
+        } else {
+            let tex_name = format!("live_frame_{run_id}_{instance_id}");
+            let handle = ctx.load_texture(tex_name, color_img, egui::TextureOptions::LINEAR);
+            self.live_frame_textures.insert(key, handle);
+        }
+        true
+    }
+
+    /// Drops cached live frame textures for runs that are no longer present in `self.runs`.
+    pub fn prune_live_frames(&mut self) {
+        let valid_runs: std::collections::HashSet<&str> =
+            self.runs.iter().map(|r| r.run_id.as_str()).collect();
+        self.live_frame_textures
+            .retain(|(run_id, _), _| valid_runs.contains(run_id.as_str()));
     }
 }
 
@@ -300,6 +438,9 @@ impl Default for HistoryState {
 pub struct AccountsState {
     pub accounts: Vec<StoredAccount>,
     pub offline_username: String,
+    pub popup_login_in_flight: bool,
+    pub popup_status_msg: Option<String>,
+    pub popup_is_error: bool,
     pub browser_code_input: String,
     pub browser_login_in_flight: bool,
     pub browser_status_msg: Option<String>,
@@ -316,6 +457,9 @@ impl Default for AccountsState {
         Self {
             accounts: Vec::new(),
             offline_username: String::new(),
+            popup_login_in_flight: false,
+            popup_status_msg: None,
+            popup_is_error: false,
             browser_code_input: String::new(),
             browser_login_in_flight: false,
             browser_status_msg: None,
@@ -517,5 +661,127 @@ mod tests {
         draft.max_total_ram_mb = 512;
         draft.default_instance_ram_mb = 1024;
         assert!(draft.to_config().is_err());
+    }
+
+    #[test]
+    fn progress_events_update_server_and_instance_progress() {
+        let cfg = DemingConfig::default();
+        let run_id = Uuid::new_v4();
+        let mut card = LiveRunCard::from_ipc(run_id.to_string(), "progress-test".to_string());
+        card.timeout_secs = 90;
+
+        card.apply_event(
+            &RunEvent::Progress {
+                timestamp: Utc::now(),
+                run_id: run_id.to_string(),
+                instance_id: None,
+                phase: "server-loader".to_string(),
+                completed: 3,
+                total: 10,
+                message: Some("Downloading server libraries".to_string()),
+            },
+            &cfg.global_limits,
+        );
+        let srv_prog = card
+            .server_progress
+            .as_ref()
+            .expect("server_progress should be recorded");
+        assert_eq!(srv_prog.phase, "server-loader");
+        assert!((srv_prog.fraction() - 0.3).abs() < 1e-4);
+
+        card.apply_event(
+            &RunEvent::Progress {
+                timestamp: Utc::now(),
+                run_id: run_id.to_string(),
+                instance_id: Some("bot-1".to_string()),
+                phase: "java".to_string(),
+                completed: 1,
+                total: 2,
+                message: Some("Extracting Java 21".to_string()),
+            },
+            &cfg.global_limits,
+        );
+        assert_eq!(card.instances.len(), 1);
+        let inst_prog = card.instances[0]
+            .progress
+            .as_ref()
+            .expect("instance progress should be recorded");
+        assert_eq!(inst_prog.phase, "java");
+        assert_eq!(inst_prog.completed, 1);
+        assert_eq!(inst_prog.total, 2);
+        assert!((inst_prog.fraction() - 0.5).abs() < 1e-4);
+
+        let t0 = Utc::now();
+        card.apply_event(
+            &RunEvent::InstanceStateChanged {
+                run_id,
+                instance_id: "bot-1".to_string(),
+                state: InstanceState::Running,
+                message: Some("running (pid 999)".to_string()),
+                timestamp: t0,
+            },
+            &cfg.global_limits,
+        );
+        assert_eq!(card.instances[0].started_at, Some(t0));
+        assert_eq!(card.completion_counts(), (0, 1));
+
+        let t1 = Utc::now();
+        card.apply_event(
+            &RunEvent::InstanceStateChanged {
+                run_id,
+                instance_id: "bot-1".to_string(),
+                state: InstanceState::Passed,
+                message: Some("ok".to_string()),
+                timestamp: t1,
+            },
+            &cfg.global_limits,
+        );
+        assert_eq!(card.instances[0].finished_at, Some(t1));
+        assert_eq!(card.completion_counts(), (1, 1));
+
+        // ServerReady clears active server setup progress.
+        card.apply_event(
+            &RunEvent::ServerReady {
+                run_id,
+                port: 25565,
+                timestamp: Utc::now(),
+            },
+            &cfg.global_limits,
+        );
+        assert!(card.server_progress.is_none());
+    }
+
+    #[test]
+    fn dashboard_apply_live_frame_creates_and_updates_texture() {
+        let mut dash = DashboardState::default();
+        let ctx = egui::Context::default();
+
+        // Reject mismatched buffer size
+        assert!(!dash.apply_live_frame(&ctx, "run-1", "inst-1", 2, 2, &[0u8; 4]));
+
+        let rgba1 = vec![255u8; 2 * 2 * 4];
+        assert!(dash.apply_live_frame(&ctx, "run-1", "inst-1", 2, 2, &rgba1));
+        let first_id = dash
+            .live_frame_textures
+            .get(&("run-1".to_string(), "inst-1".to_string()))
+            .expect("texture handle inserted")
+            .id();
+        assert_eq!(
+            dash.live_frame_textures
+                .get(&("run-1".to_string(), "inst-1".to_string()))
+                .unwrap()
+                .size(),
+            [2, 2]
+        );
+
+        // Subsequent frame updates the existing TextureHandle in-place (same TextureId)
+        let rgba2 = vec![128u8; 4 * 3 * 4];
+        assert!(dash.apply_live_frame(&ctx, "run-1", "inst-1", 4, 3, &rgba2));
+        let handle = dash
+            .live_frame_textures
+            .get(&("run-1".to_string(), "inst-1".to_string()))
+            .unwrap();
+        assert_eq!(handle.id(), first_id);
+        assert_eq!(handle.size(), [4, 3]);
     }
 }

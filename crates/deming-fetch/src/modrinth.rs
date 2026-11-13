@@ -6,6 +6,7 @@ use deming_core::{DemingError, ModLoader, ModSource, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::util::{build_http_client, compute_sha256, download_file, fetch_json};
+use crate::{report_progress, ProgressCallback};
 
 /// Official Modrinth API v2 base URL.
 pub const MODRINTH_API_V2: &str = "https://api.modrinth.com/v2";
@@ -130,18 +131,54 @@ pub async fn resolve_mods(
     cache_dir: &Path,
     instance_mods_dir: &Path,
 ) -> Result<Vec<ResolvedMod>> {
+    resolve_mods_with_progress(
+        client,
+        mods,
+        mc_version,
+        loader,
+        cache_dir,
+        instance_mods_dir,
+        None,
+    )
+    .await
+}
+
+/// Resolves all [`ModSource`] entries into `instance_mods_dir`, caching Modrinth downloads
+/// by SHA-256 under `cache_dir/mods/` and emitting progress updates.
+pub async fn resolve_mods_with_progress(
+    client: &ModrinthClient,
+    mods: &[ModSource],
+    mc_version: &str,
+    loader: ModLoader,
+    cache_dir: &Path,
+    instance_mods_dir: &Path,
+    progress: Option<ProgressCallback>,
+) -> Result<Vec<ResolvedMod>> {
     tokio::fs::create_dir_all(instance_mods_dir).await?;
+    let total = mods.len() as u64;
     let mut resolved = Vec::new();
 
-    for source in mods {
+    for (idx, source) in mods.iter().enumerate() {
         match source {
             ModSource::LocalPath(path) => {
+                report_progress(
+                    progress.as_ref(),
+                    idx as u64,
+                    total.max(1),
+                    &format!("Copying local mod(s) from {}", path.display()),
+                );
                 resolved.extend(resolve_local_mod_path(path, instance_mods_dir).await?);
             }
             ModSource::Modrinth {
                 project_id_or_slug,
                 version_id,
             } => {
+                report_progress(
+                    progress.as_ref(),
+                    idx as u64,
+                    total.max(1),
+                    &format!("Resolving Modrinth mod {project_id_or_slug}"),
+                );
                 let item = resolve_modrinth_mod(
                     client,
                     project_id_or_slug,
@@ -155,6 +192,12 @@ pub async fn resolve_mods(
                 resolved.push(item);
             }
         }
+        report_progress(
+            progress.as_ref(),
+            (idx + 1) as u64,
+            total.max(1),
+            &format!("Resolved mod {}/{total}", idx + 1),
+        );
     }
 
     Ok(resolved)
@@ -367,5 +410,53 @@ mod tests {
             mod_cache_path(cache, "deadbeef", "fabric-api.jar"),
             PathBuf::from("C:/deming/cache/mods/deadbeef/fabric-api.jar")
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_mods_with_progress_reports_updates() {
+        use std::sync::{Arc, Mutex};
+
+        let temp = std::env::temp_dir().join(format!(
+            "deming-fetch-progress-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_dir = temp.join("cache");
+        let inst_mods = temp.join("instance").join("mods");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mod_jar = temp.join("test-mod.jar");
+        std::fs::write(&mod_jar, b"fake-mod-jar").unwrap();
+
+        let events: Arc<Mutex<Vec<(u64, u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let cb: ProgressCallback = Arc::new(move |completed, total, msg| {
+            events_clone
+                .lock()
+                .unwrap()
+                .push((completed, total, msg.to_string()));
+        });
+
+        let client = ModrinthClient::new().unwrap();
+        let resolved = resolve_mods_with_progress(
+            &client,
+            &[ModSource::LocalPath(mod_jar)],
+            "1.21.4",
+            ModLoader::Fabric,
+            &cache_dir,
+            &inst_mods,
+            Some(cb),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        let recorded = events.lock().unwrap();
+        assert!(recorded.len() >= 2);
+        assert_eq!(recorded.last().unwrap().0, 1);
+        assert_eq!(recorded.last().unwrap().1, 1);
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

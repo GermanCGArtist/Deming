@@ -79,6 +79,16 @@ pub enum RunEvent {
         reason: String,
         timestamp: DateTime<Utc>,
     },
+    /// Emitted to report incremental progress for a run or instance phase.
+    Progress {
+        timestamp: DateTime<Utc>,
+        run_id: String,
+        instance_id: Option<String>,
+        phase: String,
+        completed: u64,
+        total: u64,
+        message: Option<String>,
+    },
     /// Emitted when the entire run reaches a terminal status.
     RunFinished {
         run_id: Uuid,
@@ -97,6 +107,7 @@ impl RunEvent {
             | Self::LogLine { timestamp, .. }
             | Self::ScreenshotCaptured { timestamp, .. }
             | Self::TestEvaluated { timestamp, .. }
+            | Self::Progress { timestamp, .. }
             | Self::RunFinished { timestamp, .. } => *timestamp,
         }
     }
@@ -150,4 +161,30 @@ pub struct RunManifest {
     pub server_log_path: Option<PathBuf>,
     /// Path to the exported diagnostic bundle archive, if generated.
     pub bundle_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_event_progress_json_round_trip() {
+        let ts = Utc::now();
+        let event = RunEvent::Progress {
+            timestamp: ts,
+            run_id: Uuid::new_v4().to_string(),
+            instance_id: Some("client-1".to_string()),
+            phase: "downloading_assets".to_string(),
+            completed: 1200,
+            total: 3577,
+            message: Some("Downloading assets (1200/3577)".to_string()),
+        };
+
+        assert_eq!(event.timestamp(), ts);
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+        assert_eq!(parsed.timestamp(), ts);
+    }
 }

@@ -474,6 +474,7 @@ async fn server_lifecycle_ready_pattern_and_client_timeout_on_windows() {
         timeout_secs: 1,
         extra_jvm_args: vec![],
         extra_game_args: vec!["/C".to_string(), client_bat.to_string_lossy().into_owned()],
+        cloak_window: false,
     };
 
     let outcome = run_client(client_cfg, &abort, Some(tx))

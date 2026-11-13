@@ -7,7 +7,9 @@ use deming_core::{DemingConfig, DemingError, ModLoader, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::java::{ensure_java_runtime, required_java_version};
+use crate::java::{
+    ensure_java_runtime_with_progress, required_java_version,
+};
 use crate::mojang::{
     evaluate_arguments, MojangClient, ResolvedVanilla, VersionJson,
 };
@@ -15,6 +17,7 @@ use crate::util::{
     build_http_client, current_arch, current_mojang_os, download_file, fetch_json,
     maven_coord_to_path,
 };
+use crate::{report_progress, ProgressCallback};
 
 pub const FABRIC_META_BASE: &str = "https://meta.fabricmc.net/v2";
 pub const QUILT_META_BASE: &str = "https://meta.quiltmc.org/v3";
@@ -119,11 +122,39 @@ pub async fn resolve_and_install_loader(
     work_dir: &Path,
     java_bin: Option<&Path>,
 ) -> Result<LaunchProfile> {
+    resolve_and_install_loader_with_progress(
+        config,
+        mc_version,
+        loader,
+        loader_version,
+        side,
+        work_dir,
+        java_bin,
+        None,
+    )
+    .await
+}
+
+/// Resolves and installs the requested [`ModLoader`] for either client or server,
+/// returning a ready-to-launch [`LaunchProfile`] and emitting progress updates.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_and_install_loader_with_progress(
+    config: &DemingConfig,
+    mc_version: &str,
+    loader: ModLoader,
+    loader_version: Option<&str>,
+    side: LoaderSide,
+    work_dir: &Path,
+    java_bin: Option<&Path>,
+    progress: Option<ProgressCallback>,
+) -> Result<LaunchProfile> {
     let cache_dir = config.cache_dir();
     let mojang = MojangClient::new()?;
 
     match loader {
-        ModLoader::Vanilla => install_vanilla(&mojang, mc_version, side, &cache_dir).await,
+        ModLoader::Vanilla => {
+            install_vanilla(&mojang, mc_version, side, &cache_dir, progress).await
+        }
         ModLoader::Fabric => {
             install_fabric_or_quilt(
                 &mojang,
@@ -134,6 +165,7 @@ pub async fn resolve_and_install_loader(
                 side,
                 &cache_dir,
                 true,
+                progress,
             )
             .await
         }
@@ -147,6 +179,7 @@ pub async fn resolve_and_install_loader(
                 side,
                 &cache_dir,
                 false,
+                progress,
             )
             .await
         }
@@ -159,6 +192,7 @@ pub async fn resolve_and_install_loader(
                 &cache_dir,
                 work_dir,
                 java_bin,
+                progress,
             )
             .await
         }
@@ -171,6 +205,7 @@ pub async fn resolve_and_install_loader(
                 &cache_dir,
                 work_dir,
                 java_bin,
+                progress,
             )
             .await
         }
@@ -182,15 +217,20 @@ async fn install_vanilla(
     mc_version: &str,
     side: LoaderSide,
     cache_dir: &Path,
+    progress: Option<ProgressCallback>,
 ) -> Result<LaunchProfile> {
     match side {
         LoaderSide::Client => {
-            let resolved = mojang.ensure_client(mc_version, cache_dir).await?;
+            let resolved = mojang
+                .ensure_client_with_progress(mc_version, cache_dir, progress)
+                .await?;
             Ok(build_vanilla_client_profile(&resolved))
         }
         LoaderSide::Server => {
             let vjson = mojang.fetch_version_json(mc_version, cache_dir).await?;
-            let server_jar = mojang.ensure_server(mc_version, cache_dir).await?;
+            let server_jar = mojang
+                .ensure_server_with_progress(mc_version, cache_dir, progress)
+                .await?;
             let java_major = vjson
                 .java_version
                 .as_ref()
@@ -263,8 +303,10 @@ async fn install_fabric_or_quilt(
     side: LoaderSide,
     cache_dir: &Path,
     is_fabric: bool,
+    progress: Option<ProgressCallback>,
 ) -> Result<LaunchProfile> {
     let http = build_http_client()?;
+    let loader_name = if is_fabric { "Fabric" } else { "Quilt" };
 
     let resolved_loader = match loader_version {
         Some(v) => v.to_string(),
@@ -286,13 +328,26 @@ async fn install_fabric_or_quilt(
 
     match side {
         LoaderSide::Client => {
-            let vanilla = mojang.ensure_client(mc_version, cache_dir).await?;
+            let vanilla = mojang
+                .ensure_client_with_progress(mc_version, cache_dir, progress.clone())
+                .await?;
+            report_progress(
+                progress.as_ref(),
+                0,
+                1,
+                &format!("Resolving {loader_name} {resolved_loader} profile"),
+            );
             let profile_url =
                 format!("{meta_base}/versions/loader/{mc_version}/{resolved_loader}/profile/json");
             let profile: FabricProfileJson = fetch_json(&http, &profile_url).await?;
-            let loader_libs =
-                download_fabric_libraries(&http, &profile.libraries, default_maven, cache_dir)
-                    .await?;
+            let loader_libs = download_fabric_libraries(
+                &http,
+                &profile.libraries,
+                default_maven,
+                cache_dir,
+                progress.as_ref(),
+            )
+            .await?;
 
             let mut base = build_vanilla_client_profile(&vanilla);
             let mut combined_cp = loader_libs;
@@ -316,7 +371,9 @@ async fn install_fabric_or_quilt(
         }
         LoaderSide::Server => {
             let vjson = mojang.fetch_version_json(mc_version, cache_dir).await?;
-            let vanilla_server = mojang.ensure_server(mc_version, cache_dir).await?;
+            let vanilla_server = mojang
+                .ensure_server_with_progress(mc_version, cache_dir, progress.clone())
+                .await?;
             let java_major = vjson
                 .java_version
                 .as_ref()
@@ -324,6 +381,12 @@ async fn install_fabric_or_quilt(
                 .unwrap_or_else(|| required_java_version(mc_version));
 
             if is_fabric {
+                report_progress(
+                    progress.as_ref(),
+                    0,
+                    1,
+                    &format!("Downloading {loader_name} {resolved_loader} server launcher"),
+                );
                 let installers_url = format!("{meta_base}/versions/installer");
                 let installers: Vec<FabricInstallerEntry> =
                     fetch_json(&http, &installers_url).await?;
@@ -346,6 +409,12 @@ async fn install_fabric_or_quilt(
                         "fabric-server-mc.{mc_version}-loader.{resolved_loader}-launcher.{inst_ver}.jar"
                     ));
                 download_file(&http, &server_jar_url, &dest, None, None, true).await?;
+                report_progress(
+                    progress.as_ref(),
+                    1,
+                    1,
+                    &format!("{loader_name} server launcher ready"),
+                );
 
                 Ok(LaunchProfile {
                     main_class: String::new(),
@@ -368,6 +437,7 @@ async fn install_fabric_or_quilt(
                     &profile.libraries,
                     default_maven,
                     cache_dir,
+                    progress.as_ref(),
                 )
                 .await?;
                 let mut cp = loader_libs;
@@ -393,9 +463,17 @@ async fn download_fabric_libraries(
     libs: &[FabricLibrary],
     default_maven: &str,
     cache_dir: &Path,
+    progress: Option<&ProgressCallback>,
 ) -> Result<Vec<PathBuf>> {
+    let total = libs.len() as u64;
     let mut paths = Vec::new();
-    for lib in libs {
+    for (idx, lib) in libs.iter().enumerate() {
+        report_progress(
+            progress,
+            idx as u64,
+            total.max(1),
+            &format!("Downloading loader library {}", lib.name),
+        );
         let rel = maven_coord_to_path(&lib.name).ok_or_else(|| {
             DemingError::InvalidSpec(format!("invalid Maven coordinate: {}", lib.name))
         })?;
@@ -405,9 +483,11 @@ async fn download_fabric_libraries(
         download_file(http, &url, &dest, lib.sha1.as_deref(), None, true).await?;
         paths.push(dest);
     }
+    report_progress(progress, total, total.max(1), "Loader libraries ready");
     Ok(paths)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_neoforge(
     mojang: &MojangClient,
     mc_version: &str,
@@ -416,6 +496,7 @@ async fn install_neoforge(
     cache_dir: &Path,
     work_dir: &Path,
     java_bin: Option<&Path>,
+    progress: Option<ProgressCallback>,
 ) -> Result<LaunchProfile> {
     let http = build_http_client()?;
 
@@ -440,6 +521,12 @@ async fn install_neoforge(
         }
     };
 
+    report_progress(
+        progress.as_ref(),
+        0,
+        1,
+        &format!("Downloading NeoForge {nf_version} installer"),
+    );
     let installer_url = format!(
         "{NEOFORGE_MAVEN_REPO}/net/neoforged/neoforge/{nf_version}/neoforge-{nf_version}-installer.jar"
     );
@@ -457,10 +544,12 @@ async fn install_neoforge(
         cache_dir,
         work_dir,
         java_bin,
+        progress,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_forge(
     mojang: &MojangClient,
     mc_version: &str,
@@ -469,6 +558,7 @@ async fn install_forge(
     cache_dir: &Path,
     work_dir: &Path,
     java_bin: Option<&Path>,
+    progress: Option<ProgressCallback>,
 ) -> Result<LaunchProfile> {
     let http = build_http_client()?;
 
@@ -497,6 +587,12 @@ async fn install_forge(
         format!("{mc_version}-{forge_ver}")
     };
 
+    report_progress(
+        progress.as_ref(),
+        0,
+        1,
+        &format!("Downloading Forge {full_ver} installer"),
+    );
     let installer_url = format!(
         "{FORGE_MAVEN_REPO}/net/minecraftforge/forge/{full_ver}/forge-{full_ver}-installer.jar"
     );
@@ -514,10 +610,12 @@ async fn install_forge(
         cache_dir,
         work_dir,
         java_bin,
+        progress,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_forge_installer(
     mojang: &MojangClient,
     mc_version: &str,
@@ -526,14 +624,21 @@ async fn run_forge_installer(
     cache_dir: &Path,
     work_dir: &Path,
     java_bin: Option<&Path>,
+    progress: Option<ProgressCallback>,
 ) -> Result<LaunchProfile> {
     tokio::fs::create_dir_all(work_dir).await?;
 
     let java_major = required_java_version(mc_version);
     let java_exe = match java_bin {
         Some(p) => p.to_path_buf(),
-        None => ensure_java_runtime(cache_dir, java_major).await?.executable,
+        None => {
+            ensure_java_runtime_with_progress(cache_dir, java_major, progress.clone())
+                .await?
+                .executable
+        }
     };
+
+    report_progress(progress.as_ref(), 0, 1, "Running headless mod loader installer");
 
     let flag = match side {
         LoaderSide::Client => {
@@ -566,7 +671,9 @@ async fn run_forge_installer(
 
     match side {
         LoaderSide::Client => {
-            let vanilla = mojang.ensure_client(mc_version, cache_dir).await?;
+            let vanilla = mojang
+                .ensure_client_with_progress(mc_version, cache_dir, progress)
+                .await?;
             let mut profile = build_vanilla_client_profile(&vanilla);
             if let Some(installed_json) = find_installed_version_json(work_dir)? {
                 profile.main_class = installed_json.main_class;

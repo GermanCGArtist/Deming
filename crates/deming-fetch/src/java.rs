@@ -7,6 +7,7 @@ use deming_core::{DemingError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::util::{build_http_client, current_arch, download_file, fetch_json};
+use crate::{report_progress, ProgressCallback};
 
 /// Adoptium API v3 base URL for Eclipse Temurin JRE releases.
 pub const ADOPTIUM_API_BASE: &str = "https://api.adoptium.net/v3";
@@ -177,11 +178,32 @@ pub fn detect_installed_java(cache_dir: Option<&Path>) -> Vec<JavaRuntime> {
 /// Ensures a Java runtime matching `required_major` is available, downloading a Temurin JRE
 /// into `<cache_dir>/runtimes/java-<required_major>/` if no matching runtime is installed.
 pub async fn ensure_java_runtime(cache_dir: &Path, required_major: u32) -> Result<JavaRuntime> {
+    ensure_java_runtime_with_progress(cache_dir, required_major, None).await
+}
+
+/// Ensures a Java runtime matching `required_major` is available, emitting progress updates.
+pub async fn ensure_java_runtime_with_progress(
+    cache_dir: &Path,
+    required_major: u32,
+    progress: Option<ProgressCallback>,
+) -> Result<JavaRuntime> {
+    report_progress(
+        progress.as_ref(),
+        0,
+        2,
+        &format!("Checking installed Java {required_major} runtime"),
+    );
     let installed = detect_installed_java(Some(cache_dir));
     if let Some(found) = installed
         .into_iter()
         .find(|rt| rt.major_version == required_major)
     {
+        report_progress(
+            progress.as_ref(),
+            2,
+            2,
+            &format!("Using Java {} ({})", found.major_version, found.version_string),
+        );
         return Ok(found);
     }
 
@@ -191,6 +213,12 @@ pub async fn ensure_java_runtime(cache_dir: &Path, required_major: u32) -> Resul
         "{ADOPTIUM_API_BASE}/assets/latest/{required_major}/hotspot?architecture={arch}&image_type=jre&os={os}&vendor=eclipse"
     );
 
+    report_progress(
+        progress.as_ref(),
+        0,
+        2,
+        &format!("Downloading Temurin JRE {required_major}"),
+    );
     let client = build_http_client()?;
     let assets: Vec<AdoptiumAsset> = fetch_json(&client, &api_url).await?;
     let asset = assets.into_iter().next().ok_or_else(|| {
@@ -214,6 +242,12 @@ pub async fn ensure_java_runtime(cache_dir: &Path, required_major: u32) -> Resul
     )
     .await?;
 
+    report_progress(
+        progress.as_ref(),
+        1,
+        2,
+        &format!("Extracting Temurin JRE {required_major}"),
+    );
     extract_jre_archive(&archive_path, &runtime_dir)?;
 
     let exe = find_java_exe_under(&runtime_dir).ok_or_else(|| {
@@ -224,12 +258,19 @@ pub async fn ensure_java_runtime(cache_dir: &Path, required_major: u32) -> Resul
         ))
     })?;
 
-    probe_java_executable(&exe).ok_or_else(|| {
+    let rt = probe_java_executable(&exe).ok_or_else(|| {
         DemingError::Process(format!(
             "downloaded Java executable {} failed `java -version` check",
             exe.display()
         ))
-    })
+    })?;
+    report_progress(
+        progress.as_ref(),
+        2,
+        2,
+        &format!("Java {} ready", rt.major_version),
+    );
+    Ok(rt)
 }
 
 /// Returns `<cache_dir>/runtimes/java-<major>`.

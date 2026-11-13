@@ -96,101 +96,55 @@ pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
                     ui.separator();
                     ui.add_space(12.0);
 
-                    // Primary Microsoft Browser Login (login.live.com)
+                    // Primary Microsoft One-Click WebView Popup Login
                     ui.label(
-                        RichText::new("Microsoft Account — Browser Login (Recommended)")
+                        RichText::new("Microsoft Account (Xbox Live / Minecraft)")
                             .size(15.5)
                             .strong()
                             .color(ACCENT_EMERALD),
                     );
                     ui.label(
                         RichText::new(format!(
-                            "Uses default Mojang Client ID ({DEFAULT_MSA_CLIENT_ID}) — no Azure App Registration needed."
+                            "Sign in with Microsoft using Mojang's default Client ID ({DEFAULT_MSA_CLIENT_ID}) — no Azure App Registration needed."
                         ))
                         .size(11.5)
                         .color(TEXT_MUTED),
                     );
-                    ui.add_space(6.0);
-
-                    ui.label(
-                        RichText::new(
-                            "1. Open Microsoft login in your browser and sign in.\n\
-                             2. After reaching the blank page, copy the full URL from your address bar (or the ?code= value) and paste it below.",
-                        )
-                        .size(11.5)
-                        .color(TEXT_MUTED),
-                    );
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        let auth_url =
-                            MsaClient::new(DEFAULT_MSA_CLIENT_ID).browser_authorize_url();
+                        let popup_btn = primary_button("Sign In with Microsoft (One-Click Popup)");
                         if ui
-                            .add(primary_button("Open Microsoft Login in Browser"))
+                            .add_enabled(!state.accounts.popup_login_in_flight, popup_btn)
                             .clicked()
                         {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(auth_url.clone()));
-                            state.accounts.browser_is_error = false;
-                            state.accounts.browser_status_msg = Some(
-                                "Browser opened. Complete sign-in, then paste the redirect URL below."
+                            state.accounts.popup_login_in_flight = true;
+                            state.accounts.popup_is_error = false;
+                            state.accounts.popup_status_msg = Some(
+                                "Sign-in popup open — complete Microsoft login in the popup window."
                                     .to_string(),
                             );
-                        }
-                        if ui.button("Copy Login URL").clicked() {
-                            ui.ctx().copy_text(auth_url);
-                            state.toast = Some(StatusToast {
-                                is_error: false,
-                                text: "Copied Microsoft login URL".to_string(),
-                                created_at: Utc::now(),
-                            });
+                            bridge.start_popup_login(state.config.clone());
                         }
                     });
 
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.accounts.browser_code_input)
-                                .desired_width(260.0)
-                                .hint_text(
-                                    "https://login.live.com/oauth20_desktop.srf?code=... or code",
-                                ),
-                        );
-
-                        let can_complete = !state.accounts.browser_login_in_flight
-                            && !state.accounts.browser_code_input.trim().is_empty();
-                        if ui
-                            .add_enabled(can_complete, primary_button("Complete Sign-In"))
-                            .clicked()
-                        {
-                            state.accounts.browser_login_in_flight = true;
-                            state.accounts.browser_is_error = false;
-                            state.accounts.browser_status_msg = Some(
-                                "Exchanging authorization code with Microsoft / Xbox / Minecraft..."
-                                    .to_string(),
-                            );
-                            bridge.complete_browser_login(
-                                state.config.clone(),
-                                state.accounts.browser_code_input.trim().to_string(),
-                            );
-                        }
-                    });
-
-                    if state.accounts.browser_login_in_flight {
+                    if state.accounts.popup_login_in_flight {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(
-                                RichText::new("Completing Microsoft sign-in...").color(INFO_BLUE),
+                                RichText::new("Waiting for Microsoft sign-in popup...")
+                                    .color(INFO_BLUE),
                             );
                         });
                     }
 
-                    if let Some(ref status) = state.accounts.browser_status_msg {
+                    if let Some(ref status) = state.accounts.popup_status_msg {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(status)
                                 .size(12.0)
-                                .color(if state.accounts.browser_is_error {
+                                .color(if state.accounts.popup_is_error {
                                     DANGER_RED
                                 } else {
                                     TEXT_MUTED
@@ -198,9 +152,108 @@ pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
                         );
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(14.0);
                     ui.separator();
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
+
+                    // Secondary collapsible Manual Browser URL Paste
+                    egui::CollapsingHeader::new(
+                        RichText::new("Manual Browser Login (Paste Redirect URL)")
+                            .size(13.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "1. Open Microsoft login in your browser and sign in.\n\
+                                 2. After reaching the blank page, copy the full URL from your address bar (or the ?code= value) and paste it below.",
+                            )
+                            .size(11.5)
+                            .color(TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            let auth_url =
+                                MsaClient::new(DEFAULT_MSA_CLIENT_ID).browser_authorize_url();
+                            if ui
+                                .add(primary_button("Open Microsoft Login in Browser"))
+                                .clicked()
+                            {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(auth_url.clone()));
+                                state.accounts.browser_is_error = false;
+                                state.accounts.browser_status_msg = Some(
+                                    "Browser opened. Complete sign-in, then paste the redirect URL below."
+                                        .to_string(),
+                                );
+                            }
+                            if ui.button("Copy Login URL").clicked() {
+                                ui.ctx().copy_text(auth_url);
+                                state.toast = Some(StatusToast {
+                                    is_error: false,
+                                    text: "Copied Microsoft login URL".to_string(),
+                                    created_at: Utc::now(),
+                                });
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.accounts.browser_code_input)
+                                    .desired_width(260.0)
+                                    .hint_text(
+                                        "https://login.live.com/oauth20_desktop.srf?code=... or code",
+                                    ),
+                            );
+
+                            let can_complete = !state.accounts.browser_login_in_flight
+                                && !state.accounts.browser_code_input.trim().is_empty();
+                            if ui
+                                .add_enabled(can_complete, primary_button("Complete Sign-In"))
+                                .clicked()
+                            {
+                                state.accounts.browser_login_in_flight = true;
+                                state.accounts.browser_is_error = false;
+                                state.accounts.browser_status_msg = Some(
+                                    "Exchanging authorization code with Microsoft / Xbox / Minecraft..."
+                                        .to_string(),
+                                );
+                                bridge.complete_browser_login(
+                                    state.config.clone(),
+                                    state.accounts.browser_code_input.trim().to_string(),
+                                );
+                            }
+                        });
+
+                        if state.accounts.browser_login_in_flight {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new("Completing Microsoft sign-in...")
+                                        .color(INFO_BLUE),
+                                );
+                            });
+                        }
+
+                        if let Some(ref status) = state.accounts.browser_status_msg {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(status)
+                                    .size(12.0)
+                                    .color(if state.accounts.browser_is_error {
+                                        DANGER_RED
+                                    } else {
+                                        TEXT_MUTED
+                                    }),
+                            );
+                        }
+                    });
+
+                    ui.add_space(8.0);
 
                     // Secondary collapsible Device-Code Flow
                     egui::CollapsingHeader::new(

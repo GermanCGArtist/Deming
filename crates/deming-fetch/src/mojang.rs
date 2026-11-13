@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use deming_core::{DemingError, Result};
 use futures_util::stream::{self, StreamExt};
@@ -11,6 +13,7 @@ use crate::util::{
     build_http_client, current_arch, current_mojang_os, download_file, fetch_json,
     maven_coord_to_path, verify_sha1,
 };
+use crate::{report_progress, ProgressCallback};
 
 /// Official Mojang Piston Meta v2 version manifest URL.
 pub const PISTON_META_MANIFEST_URL: &str =
@@ -272,9 +275,33 @@ impl MojangClient {
         mc_version: &str,
         cache_dir: &Path,
     ) -> Result<ResolvedVanilla> {
+        self.ensure_client_with_progress(mc_version, cache_dir, None)
+            .await
+    }
+
+    /// Ensures the vanilla client JAR, OS-filtered libraries, asset index, and asset objects
+    /// are downloaded and SHA-1 verified into `cache_dir`, emitting progress updates.
+    pub async fn ensure_client_with_progress(
+        &self,
+        mc_version: &str,
+        cache_dir: &Path,
+        progress: Option<ProgressCallback>,
+    ) -> Result<ResolvedVanilla> {
+        report_progress(
+            progress.as_ref(),
+            0,
+            1,
+            &format!("Fetching version manifest for {mc_version}"),
+        );
         let version_json = self.fetch_version_json(mc_version, cache_dir).await?;
 
         // 1. Client JAR
+        report_progress(
+            progress.as_ref(),
+            0,
+            1,
+            &format!("Downloading {mc_version} client JAR"),
+        );
         let client_jar = client_jar_path(cache_dir, mc_version);
         download_file(
             &self.http,
@@ -285,6 +312,12 @@ impl MojangClient {
             false,
         )
         .await?;
+        report_progress(
+            progress.as_ref(),
+            1,
+            1,
+            &format!("Client JAR {mc_version} ready"),
+        );
 
         // 2. OS-filtered libraries
         let os_name = current_mojang_os();
@@ -292,11 +325,21 @@ impl MojangClient {
         let natives_dir = cache_dir.join("natives").join(mc_version);
         tokio::fs::create_dir_all(&natives_dir).await?;
 
+        let allowed_libs: Vec<&Library> = version_json
+            .libraries
+            .iter()
+            .filter(|lib| is_rule_list_allowed(lib.rules.as_deref(), os_name, os_arch))
+            .collect();
+        let total_libs = allowed_libs.len() as u64;
+
         let mut library_paths = Vec::new();
-        for lib in &version_json.libraries {
-            if !is_rule_list_allowed(lib.rules.as_deref(), os_name, os_arch) {
-                continue;
-            }
+        for (idx, lib) in allowed_libs.into_iter().enumerate() {
+            report_progress(
+                progress.as_ref(),
+                idx as u64,
+                total_libs.max(1),
+                &format!("Downloading library {}", lib.name),
+            );
 
             if let Some(downloads) = &lib.downloads {
                 if let Some(artifact) = &downloads.artifact {
@@ -357,6 +400,12 @@ impl MojangClient {
                 }
             }
         }
+        report_progress(
+            progress.as_ref(),
+            total_libs,
+            total_libs.max(1),
+            "Libraries ready",
+        );
 
         // 3. Asset index & objects
         let assets_dir = cache_dir.join("assets");
@@ -373,7 +422,8 @@ impl MojangClient {
 
         let index_raw = tokio::fs::read_to_string(&index_path).await?;
         let index_json: AssetIndexJson = serde_json::from_str(&index_raw)?;
-        self.ensure_asset_objects(&assets_dir, &index_json).await?;
+        self.ensure_asset_objects(&assets_dir, &index_json, progress.as_ref())
+            .await?;
 
         Ok(ResolvedVanilla {
             asset_index_id: version_json.asset_index.id.clone(),
@@ -390,6 +440,7 @@ impl MojangClient {
         &self,
         assets_dir: &Path,
         index_json: &AssetIndexJson,
+        progress: Option<&ProgressCallback>,
     ) -> Result<()> {
         let mut to_download = Vec::new();
         for obj in index_json.objects.values() {
@@ -404,12 +455,30 @@ impl MojangClient {
             }
         }
 
+        let total = to_download.len() as u64;
+        if total == 0 {
+            report_progress(progress, 0, 0, "Assets up to date");
+            return Ok(());
+        }
+
+        let completed = Arc::new(AtomicU64::new(0));
         let http = self.http.clone();
         let results: Vec<Result<()>> = stream::iter(to_download)
             .map(|(url, dest, sha1)| {
                 let http = http.clone();
+                let completed = Arc::clone(&completed);
+                let progress = progress.cloned();
                 async move {
                     download_file(&http, &url, &dest, Some(&sha1), None, false).await?;
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == total || done % 50 == 0 {
+                        report_progress(
+                            progress.as_ref(),
+                            done,
+                            total,
+                            &format!("Downloading assets ({done}/{total})"),
+                        );
+                    }
                     Ok(())
                 }
             })
@@ -425,12 +494,36 @@ impl MojangClient {
 
     /// Ensures the vanilla dedicated server JAR is downloaded and SHA-1 verified.
     pub async fn ensure_server(&self, mc_version: &str, cache_dir: &Path) -> Result<PathBuf> {
+        self.ensure_server_with_progress(mc_version, cache_dir, None)
+            .await
+    }
+
+    /// Ensures the vanilla dedicated server JAR is downloaded and SHA-1 verified,
+    /// emitting progress updates.
+    pub async fn ensure_server_with_progress(
+        &self,
+        mc_version: &str,
+        cache_dir: &Path,
+        progress: Option<ProgressCallback>,
+    ) -> Result<PathBuf> {
+        report_progress(
+            progress.as_ref(),
+            0,
+            1,
+            &format!("Fetching server metadata for {mc_version}"),
+        );
         let version_json = self.fetch_version_json(mc_version, cache_dir).await?;
         let server_dl = version_json.downloads.server.ok_or_else(|| {
             DemingError::InvalidSpec(format!(
                 "Minecraft version '{mc_version}' has no server download in Mojang manifest"
             ))
         })?;
+        report_progress(
+            progress.as_ref(),
+            0,
+            1,
+            &format!("Downloading {mc_version} server JAR"),
+        );
         let dest = server_jar_path(cache_dir, mc_version);
         download_file(
             &self.http,
@@ -441,6 +534,12 @@ impl MojangClient {
             false,
         )
         .await?;
+        report_progress(
+            progress.as_ref(),
+            1,
+            1,
+            &format!("Server JAR {mc_version} ready"),
+        );
         Ok(dest)
     }
 }

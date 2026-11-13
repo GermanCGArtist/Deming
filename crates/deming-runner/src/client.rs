@@ -104,6 +104,10 @@ pub struct ClientLaunchConfig {
     pub extra_jvm_args: Vec<String>,
     /// Additional game arguments appended after `spec.game_args`.
     pub extra_game_args: Vec<String>,
+    /// When `true` on Windows, watches for the spawned client window and cloaks/hides it
+    /// from the desktop and taskbar (`DWMWA_CLOAK` + `WS_EX_TOOLWINDOW`) so live frames
+    /// can be captured invisibly in the background.
+    pub cloak_window: bool,
 }
 
 /// Filters out unexpanded Mojang `${...}` placeholder arguments and their preceding flags
@@ -327,6 +331,27 @@ pub async fn run_client(
 
     let mut reader_tasks = Vec::new();
 
+    let cloak_task = if config.cloak_window {
+        pid.map(|target_pid| {
+            tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                let max_watch = Duration::from_secs(30);
+                while start.elapsed() < max_watch {
+                    if let Ok(updated) =
+                        crate::screenshot::cloak_and_hide_from_taskbar(target_pid, true)
+                    {
+                        if updated > 0 {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            })
+        })
+    } else {
+        None
+    };
+
     if let Some(out) = stdout {
         let out_ref = Arc::clone(&stdout_buf);
         let comb_ref = Arc::clone(&combined_buf);
@@ -415,6 +440,11 @@ pub async fn run_client(
                 let _ = child.wait().await;
             }
         }
+    }
+
+    if let Some(task) = cloak_task {
+        task.abort();
+        let _ = task.await;
     }
 
     for task in reader_tasks {
@@ -509,6 +539,7 @@ mod tests {
             timeout_secs: 60,
             extra_jvm_args: vec![],
             extra_game_args: vec![],
+            cloak_window: false,
         };
 
         let args = cfg.build_args();
@@ -620,6 +651,7 @@ mod tests {
                 "${auth_access_token}".to_string(),
                 "--demo".to_string(),
             ],
+            cloak_window: false,
         };
 
         let args = cfg.build_args();

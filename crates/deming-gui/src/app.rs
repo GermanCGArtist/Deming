@@ -20,14 +20,21 @@ use crate::views;
 pub struct DemingApp {
     state: UiState,
     bridge: GuiBridge,
+    header_icon: Option<egui::TextureHandle>,
     theme_applied: bool,
 }
 
 impl DemingApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = default_config_path();
         let config = DemingConfig::load_or_default(&config_path).unwrap_or_default();
         let accounts = AccountStore::from_config(&config).load().unwrap_or_default();
+
+        let header_icon = crate::load_embedded_icon_rgba().ok().map(|(w, h, rgba)| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            cc.egui_ctx
+                .load_texture("deming_header_icon", image, egui::TextureOptions::LINEAR)
+        });
 
         let bridge = GuiBridge::new();
         bridge.start_ipc_server(config.workspace_dir.clone());
@@ -54,11 +61,12 @@ impl DemingApp {
         Self {
             state,
             bridge,
+            header_icon,
             theme_applied: false,
         }
     }
 
-    fn process_bridge_messages(&mut self) {
+    fn process_bridge_messages(&mut self, ctx: &egui::Context) {
         let messages = self.bridge.drain_messages();
         for msg in messages {
             match msg {
@@ -131,6 +139,41 @@ impl DemingApp {
                         });
                     }
                 }
+                BridgeMessage::LiveFrameCaptured {
+                    run_id,
+                    instance_id,
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    self.state.dashboard.apply_live_frame(
+                        ctx,
+                        &run_id,
+                        &instance_id,
+                        width,
+                        height,
+                        &rgba,
+                    );
+                }
+                BridgeMessage::InstanceUncloaked {
+                    instance_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        self.state.toast = Some(StatusToast {
+                            is_error: false,
+                            text: format!("Restored window for {instance_id} to desktop"),
+                            created_at: Utc::now(),
+                        });
+                    }
+                    Err(err) => {
+                        self.state.toast = Some(StatusToast {
+                            is_error: true,
+                            text: format!("Failed to uncloak {instance_id}: {err}"),
+                            created_at: Utc::now(),
+                        });
+                    }
+                },
                 BridgeMessage::LocalRunFinished { run_id, result } => {
                     let id_str = run_id.to_string();
                     match result {
@@ -236,6 +279,28 @@ impl DemingApp {
                         }
                     }
                 }
+                BridgeMessage::MsaPopupLoginFinished(res) => {
+                    self.state.accounts.popup_login_in_flight = false;
+                    match res {
+                        Ok(session) => {
+                            self.state.accounts.popup_is_error = false;
+                            self.state.accounts.popup_status_msg = Some(format!(
+                                "Signed in as {} ({})",
+                                session.username, session.uuid
+                            ));
+                            views::accounts::refresh_accounts(&mut self.state);
+                            self.state.toast = Some(StatusToast {
+                                is_error: false,
+                                text: format!("Signed in with Microsoft as {}", session.username),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        Err(err) => {
+                            self.state.accounts.popup_is_error = true;
+                            self.state.accounts.popup_status_msg = Some(err);
+                        }
+                    }
+                }
             }
         }
     }
@@ -249,7 +314,7 @@ impl eframe::App for DemingApp {
             self.theme_applied = true;
         }
 
-        self.process_bridge_messages();
+        self.process_bridge_messages(ctx);
 
         // Top Navigation Bar
         egui::TopBottomPanel::top("deming_top_nav")
@@ -261,8 +326,15 @@ impl eframe::App for DemingApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(ref icon_tex) = self.header_icon {
+                        ui.add(
+                            egui::Image::from_texture(icon_tex)
+                                .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                                .corner_radius(egui::CornerRadius::same(4)),
+                        );
+                    }
                     ui.label(
-                        RichText::new("◆ DEMING")
+                        RichText::new("DEMING")
                             .size(18.0)
                             .strong()
                             .color(ACCENT_EMERALD),

@@ -1,9 +1,10 @@
 //! Background Tokio runtime, IPC server bridge, local job executor, and MSA login tasks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deming_archive::{apply_retention, RunArchiveWriter};
@@ -13,17 +14,20 @@ use deming_core::{
     RunManifest, RunStatus, TestJobSpec,
 };
 use deming_fetch::{
-    ensure_java_runtime, resolve_and_install_loader, resolve_mods, LaunchProfile, LoaderSide,
-    ModrinthClient,
+    ensure_java_runtime_with_progress, resolve_and_install_loader_with_progress,
+    resolve_mods_with_progress, LaunchProfile, LoaderSide, ModrinthClient, ProgressCallback,
 };
 use deming_ipc::{IpcBroadcaster, IpcMessage, IpcServer};
 use deming_runner::{
-    capture_instance_screenshot, evaluate_rule, index_screenshots, run_client, ClientLaunchConfig,
-    EvaluationContext, ResourceScheduler, ServerLaunchConfig, ServerProcess, AbortHandle,
+    capture_instance_screenshot, capture_pid_rgba, cloak_and_hide_from_taskbar, evaluate_rule,
+    index_screenshots, run_client, AbortHandle, ClientLaunchConfig, EvaluationContext,
+    ResourceScheduler, ServerLaunchConfig, ServerProcess,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+
+use crate::login_webview::is_oauth_callback_url;
 
 /// Default Microsoft Azure public client ID for Minecraft OAuth flows.
 pub const DEFAULT_MSA_CLIENT_ID: &str = deming_auth::msa::MOJANG_CLIENT_ID;
@@ -68,6 +72,17 @@ pub enum BridgeMessage {
         path: Option<String>,
         error: Option<String>,
     },
+    LiveFrameCaptured {
+        run_id: String,
+        instance_id: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    InstanceUncloaked {
+        instance_id: String,
+        result: Result<(), String>,
+    },
     LocalRunFinished {
         run_id: Uuid,
         result: Result<RunManifest, String>,
@@ -75,6 +90,7 @@ pub enum BridgeMessage {
     MsaDeviceCodeReady(Result<DeviceCodePrompt, String>),
     MsaLoginFinished(Result<MsaSession, String>),
     MsaBrowserLoginFinished(Result<MsaSession, String>),
+    MsaPopupLoginFinished(Result<MsaSession, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +111,8 @@ pub struct GuiBridge {
     ipc_shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     local_runs: Arc<Mutex<HashMap<String, LocalRunControl>>>,
     msa_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    live_capture_inflight: Arc<Mutex<HashSet<(String, String)>>>,
+    live_capture_last: Arc<Mutex<HashMap<(String, String), Instant>>>,
     egui_ctx: Arc<Mutex<Option<egui::Context>>>,
 }
 
@@ -116,6 +134,8 @@ impl GuiBridge {
             ipc_shutdown: Arc::new(Mutex::new(None)),
             local_runs: Arc::new(Mutex::new(HashMap::new())),
             msa_cancel: Arc::new(Mutex::new(None)),
+            live_capture_inflight: Arc::new(Mutex::new(HashSet::new())),
+            live_capture_last: Arc::new(Mutex::new(HashMap::new())),
             egui_ctx: Arc::new(Mutex::new(None)),
         }
     }
@@ -466,6 +486,182 @@ impl GuiBridge {
         });
     }
 
+    /// Spawns a one-click native WebView popup (`--login-popup`) to authenticate via Microsoft,
+    /// reads the captured redirect URL from stdout, exchanges the code, and saves the account.
+    pub fn start_popup_login(&self, config: DemingConfig) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+
+        self.runtime.spawn(async move {
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    emit_ui(
+                        &ui_tx,
+                        &egui_ctx,
+                        BridgeMessage::MsaPopupLoginFinished(Err(format!(
+                            "Failed to locate current executable: {e}"
+                        ))),
+                    );
+                    return;
+                }
+            };
+
+            let output = match tokio::process::Command::new(exe)
+                .arg("--login-popup")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    emit_ui(
+                        &ui_tx,
+                        &egui_ctx,
+                        BridgeMessage::MsaPopupLoginFinished(Err(format!(
+                            "Failed to launch login popup process: {e}"
+                        ))),
+                    );
+                    return;
+                }
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let captured = stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| is_oauth_callback_url(line))
+                .map(str::to_string);
+
+            let Some(callback_url) = captured else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let msg = if !output.status.success() && !stderr.is_empty() {
+                    format!("Microsoft login popup error: {stderr}")
+                } else {
+                    "Microsoft sign-in window closed before completing authentication."
+                        .to_string()
+                };
+                emit_ui(
+                    &ui_tx,
+                    &egui_ctx,
+                    BridgeMessage::MsaPopupLoginFinished(Err(msg)),
+                );
+                return;
+            };
+
+            let client = MsaClient::new(DEFAULT_MSA_CLIENT_ID);
+            match client.complete_browser_login(&callback_url).await {
+                Ok(session) => {
+                    let store = AccountStore::from_config(&config);
+                    if let Err(e) = store.upsert(StoredAccount::from_msa(&session)) {
+                        emit_ui(
+                            &ui_tx,
+                            &egui_ctx,
+                            BridgeMessage::MsaPopupLoginFinished(Err(format!(
+                                "Login succeeded but failed to save account: {e}"
+                            ))),
+                        );
+                    } else {
+                        emit_ui(
+                            &ui_tx,
+                            &egui_ctx,
+                            BridgeMessage::MsaPopupLoginFinished(Ok(session)),
+                        );
+                    }
+                }
+                Err(e) => {
+                    emit_ui(
+                        &ui_tx,
+                        &egui_ctx,
+                        BridgeMessage::MsaPopupLoginFinished(Err(e.to_string())),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Requests ~3 FPS RGBA frame captures for the given `(run_id, instance_id, pid)` targets
+    /// when their cooldown (`333ms`) has elapsed and no capture is currently in flight.
+    pub fn request_live_frames_if_due(&self, targets: &[(String, String, u32)]) {
+        const FRAME_INTERVAL: Duration = Duration::from_millis(333);
+        let now = Instant::now();
+
+        for (run_id, instance_id, pid) in targets {
+            let key = (run_id.clone(), instance_id.clone());
+
+            let should_skip_time = self
+                .live_capture_last
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&key).copied())
+                .map(|last| now.duration_since(last) < FRAME_INTERVAL)
+                .unwrap_or(false);
+            if should_skip_time {
+                continue;
+            }
+
+            {
+                let Ok(mut inflight) = self.live_capture_inflight.lock() else {
+                    continue;
+                };
+                if !inflight.insert(key.clone()) {
+                    continue;
+                }
+            }
+            if let Ok(mut last_map) = self.live_capture_last.lock() {
+                last_map.insert(key.clone(), now);
+            }
+
+            let ui_tx = self.ui_tx.clone();
+            let egui_ctx = Arc::clone(&self.egui_ctx);
+            let inflight_arc = Arc::clone(&self.live_capture_inflight);
+            let r_id = run_id.clone();
+            let i_id = instance_id.clone();
+            let target_pid = *pid;
+
+            self.runtime.spawn_blocking(move || {
+                let res = capture_pid_rgba(target_pid, 480);
+                if let Ok(mut inflight) = inflight_arc.lock() {
+                    inflight.remove(&(r_id.clone(), i_id.clone()));
+                }
+                if let Ok(Some((width, height, rgba))) = res {
+                    emit_ui(
+                        &ui_tx,
+                        &egui_ctx,
+                        BridgeMessage::LiveFrameCaptured {
+                            run_id: r_id,
+                            instance_id: i_id,
+                            width,
+                            height,
+                            rgba,
+                        },
+                    );
+                }
+            });
+        }
+    }
+
+    /// Uncloaks a running Minecraft instance window and restores it to the desktop/taskbar.
+    pub fn uncloak_instance(&self, instance_id: String, pid: u32) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+        self.runtime.spawn_blocking(move || {
+            let res = cloak_and_hide_from_taskbar(pid, false)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            emit_ui(
+                &ui_tx,
+                &egui_ctx,
+                BridgeMessage::InstanceUncloaked {
+                    instance_id,
+                    result: res,
+                },
+            );
+        });
+    }
+
     pub fn cancel_msa_login(&self) {
         if let Ok(mut g) = self.msa_cancel.lock() {
             if let Some(tx) = g.take() {
@@ -761,9 +957,11 @@ async fn execute_local_job(
             .join(format!("{}_{}", spec.name.replace(' ', "_"), run_id));
         let cache_dir = config.cache_dir();
 
-        let java_rt = match ensure_java_runtime(
+        let java_cb = make_throttled_progress_callback(run_id, None, "server-java", ev_tx.clone());
+        let java_rt = match ensure_java_runtime_with_progress(
             &cache_dir,
             deming_fetch::required_java_version(&srv_spec.mc_version),
+            Some(java_cb),
         )
         .await
         {
@@ -790,7 +988,9 @@ async fn execute_local_job(
             }
         };
 
-        let profile = match resolve_and_install_loader(
+        let loader_cb =
+            make_throttled_progress_callback(run_id, None, "server-loader", ev_tx.clone());
+        let profile = match resolve_and_install_loader_with_progress(
             &config,
             &srv_spec.mc_version,
             srv_spec.loader,
@@ -798,6 +998,7 @@ async fn execute_local_job(
             LoaderSide::Server,
             &server_dir,
             Some(&java_rt.executable),
+            Some(loader_cb),
         )
         .await
         {
@@ -826,13 +1027,16 @@ async fn execute_local_job(
 
         if !srv_spec.mods.is_empty() {
             let modrinth = ModrinthClient::new().map_err(|e| e.to_string())?;
-            if let Err(e) = resolve_mods(
+            let mods_cb =
+                make_throttled_progress_callback(run_id, None, "server-mods", ev_tx.clone());
+            if let Err(e) = resolve_mods_with_progress(
                 &modrinth,
                 &srv_spec.mods,
                 &srv_spec.mc_version,
                 srv_spec.loader,
                 &cache_dir,
                 &server_dir.join("mods"),
+                Some(mods_cb),
             )
             .await
             {
@@ -1141,9 +1345,12 @@ async fn run_single_instance(
     });
 
     let cache_dir = config.cache_dir();
-    let java_rt = match ensure_java_runtime(
+    let java_cb =
+        make_throttled_progress_callback(run_id, Some(spec.id.clone()), "java", ev_tx.clone());
+    let java_rt = match ensure_java_runtime_with_progress(
         &cache_dir,
         deming_fetch::required_java_version(&spec.mc_version),
+        Some(java_cb),
     )
     .await
     {
@@ -1154,7 +1361,9 @@ async fn run_single_instance(
         }
     };
 
-    let profile = match resolve_and_install_loader(
+    let loader_cb =
+        make_throttled_progress_callback(run_id, Some(spec.id.clone()), "loader", ev_tx.clone());
+    let profile = match resolve_and_install_loader_with_progress(
         &config,
         &spec.mc_version,
         spec.loader,
@@ -1162,6 +1371,7 @@ async fn run_single_instance(
         LoaderSide::Client,
         &inst_dir,
         Some(&java_rt.executable),
+        Some(loader_cb),
     )
     .await
     {
@@ -1181,13 +1391,20 @@ async fn run_single_instance(
     if !spec.mods.is_empty() {
         match ModrinthClient::new() {
             Ok(client) => {
-                if let Err(e) = resolve_mods(
+                let mods_cb = make_throttled_progress_callback(
+                    run_id,
+                    Some(spec.id.clone()),
+                    "mods",
+                    ev_tx.clone(),
+                );
+                if let Err(e) = resolve_mods_with_progress(
                     &client,
                     &spec.mods,
                     &spec.mc_version,
                     spec.loader,
                     &cache_dir,
                     &inst_dir.join("mods"),
+                    Some(mods_cb),
                 )
                 .await
                 {
@@ -1249,6 +1466,7 @@ async fn run_single_instance(
         timeout_secs,
         extra_jvm_args,
         extra_game_args,
+        cloak_window: true,
     };
 
     let outcome = match run_client(launch_cfg, &inst_abort, Some(ev_tx.clone())).await {
@@ -1493,4 +1711,50 @@ pub fn parse_pid_from_message(msg: &str) -> Option<u32> {
     let rest = &msg[start..];
     let end = rest.find(')')?;
     rest[..end].trim().parse::<u32>().ok()
+}
+
+/// Builds a [`ProgressCallback`] that emits [`RunEvent::Progress`] throttled to ~200ms
+/// (always forwarding completion updates where `completed >= total`).
+fn make_throttled_progress_callback(
+    run_id: Uuid,
+    instance_id: Option<String>,
+    phase: &'static str,
+    ev_tx: mpsc::UnboundedSender<RunEvent>,
+) -> ProgressCallback {
+    let last_emit: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let run_id_str = run_id.to_string();
+    Arc::new(move |completed: u64, total: u64, message: &str| {
+        let now = Instant::now();
+        let is_complete = total > 0 && completed >= total;
+        let should_emit = if let Ok(mut guard) = last_emit.lock() {
+            let due = guard
+                .map(|prev| now.duration_since(prev) >= Duration::from_millis(200))
+                .unwrap_or(true);
+            if due || is_complete {
+                *guard = Some(now);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if !should_emit {
+            return;
+        }
+        let msg = message.trim();
+        let _ = ev_tx.send(RunEvent::Progress {
+            timestamp: Utc::now(),
+            run_id: run_id_str.clone(),
+            instance_id: instance_id.clone(),
+            phase: phase.to_string(),
+            completed,
+            total,
+            message: if msg.is_empty() {
+                None
+            } else {
+                Some(msg.to_string())
+            },
+        });
+    })
 }

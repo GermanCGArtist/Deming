@@ -13,8 +13,9 @@ use deming_core::{
     RunStatus, TestJobSpec,
 };
 use deming_fetch::{
-    ensure_java_runtime, required_java_version, resolve_and_install_loader, resolve_mods,
-    LoaderSide, ModrinthClient,
+    ensure_java_runtime_with_progress, required_java_version,
+    resolve_and_install_loader_with_progress, resolve_mods_with_progress, LoaderSide,
+    ModrinthClient, ProgressCallback,
 };
 use deming_ipc::{IpcClient, IpcMessage, IpcServer};
 use deming_runner::{
@@ -241,11 +242,20 @@ pub async fn execute_job(
             tokio::fs::create_dir_all(&server_dir).await?;
 
             let java_ver = required_java_version(&server_spec.mc_version);
-            let java = ensure_java_runtime(&config.cache_dir(), java_ver)
-                .await
-                .context("failed to provision Java runtime for server")?;
+            let java = ensure_java_runtime_with_progress(
+                &config.cache_dir(),
+                java_ver,
+                Some(make_progress_callback(
+                    event_tx.clone(),
+                    run_id,
+                    None,
+                    "java",
+                )),
+            )
+            .await
+            .context("failed to provision Java runtime for server")?;
 
-            let profile = resolve_and_install_loader(
+            let profile = resolve_and_install_loader_with_progress(
                 config,
                 &server_spec.mc_version,
                 server_spec.loader,
@@ -253,17 +263,29 @@ pub async fn execute_job(
                 LoaderSide::Server,
                 &server_dir,
                 Some(&java.executable),
+                Some(make_progress_callback(
+                    event_tx.clone(),
+                    run_id,
+                    None,
+                    "loader",
+                )),
             )
             .await
             .context("failed to resolve/install server loader")?;
 
-            resolve_mods(
+            resolve_mods_with_progress(
                 &modrinth,
                 &server_spec.mods,
                 &server_spec.mc_version,
                 server_spec.loader,
                 &config.cache_dir(),
                 &server_dir.join("mods"),
+                Some(make_progress_callback(
+                    event_tx.clone(),
+                    run_id,
+                    None,
+                    "mods",
+                )),
             )
             .await
             .context("failed to resolve server mods")?;
@@ -524,12 +546,23 @@ async fn run_single_instance(
     }
 
     let java_ver = required_java_version(&inst.mc_version);
-    let java = match ensure_java_runtime(&config.cache_dir(), java_ver).await {
+    let java = match ensure_java_runtime_with_progress(
+        &config.cache_dir(),
+        java_ver,
+        Some(make_progress_callback(
+            event_tx.clone(),
+            run_id,
+            Some(inst.id.clone()),
+            "java",
+        )),
+    )
+    .await
+    {
         Ok(j) => j,
         Err(e) => return fail_result(&event_tx, run_id, &inst.id, format!("Java error: {e}")),
     };
 
-    let profile = match resolve_and_install_loader(
+    let profile = match resolve_and_install_loader_with_progress(
         config,
         &inst.mc_version,
         inst.loader,
@@ -537,6 +570,12 @@ async fn run_single_instance(
         LoaderSide::Client,
         &instance_dir,
         Some(&java.executable),
+        Some(make_progress_callback(
+            event_tx.clone(),
+            run_id,
+            Some(inst.id.clone()),
+            "loader",
+        )),
     )
     .await
     {
@@ -544,13 +583,19 @@ async fn run_single_instance(
         Err(e) => return fail_result(&event_tx, run_id, &inst.id, format!("Loader error: {e}")),
     };
 
-    if let Err(e) = resolve_mods(
+    if let Err(e) = resolve_mods_with_progress(
         &modrinth,
         &inst.mods,
         &inst.mc_version,
         inst.loader,
         &config.cache_dir(),
         &instance_dir.join("mods"),
+        Some(make_progress_callback(
+            event_tx.clone(),
+            run_id,
+            Some(inst.id.clone()),
+            "mods",
+        )),
     )
     .await
     {
@@ -587,6 +632,7 @@ async fn run_single_instance(
         timeout_secs,
         extra_jvm_args: strip_unexpanded_mojang_args(&profile.jvm_args),
         extra_game_args: strip_unexpanded_mojang_args(&profile.game_args),
+        cloak_window: false,
     };
 
     let outcome = match run_client(launch_cfg, &abort, Some(event_tx.clone())).await {
@@ -729,6 +775,43 @@ async fn resolve_account_token(
             }
         }
     }
+}
+
+fn make_progress_callback(
+    event_tx: mpsc::UnboundedSender<RunEvent>,
+    run_id: Uuid,
+    instance_id: Option<String>,
+    phase: &'static str,
+) -> ProgressCallback {
+    let last_emit = Arc::new(std::sync::Mutex::new(Option::<std::time::Instant>::None));
+    let run_id_str = run_id.to_string();
+    Arc::new(move |completed, total, message| {
+        let now = std::time::Instant::now();
+        let is_done = total > 0 && completed >= total;
+        let should_emit = {
+            let mut guard = last_emit.lock().unwrap_or_else(|e| e.into_inner());
+            let elapsed_ok = guard
+                .map(|prev| now.duration_since(prev) >= Duration::from_millis(250))
+                .unwrap_or(true);
+            if is_done || elapsed_ok {
+                *guard = Some(now);
+                true
+            } else {
+                false
+            }
+        };
+        if should_emit {
+            let _ = event_tx.send(RunEvent::Progress {
+                timestamp: Utc::now(),
+                run_id: run_id_str.clone(),
+                instance_id: instance_id.clone(),
+                phase: phase.to_string(),
+                completed,
+                total,
+                message: Some(message.to_string()),
+            });
+        }
+    })
 }
 
 fn strip_unexpanded_mojang_args(args: &[String]) -> Vec<String> {
