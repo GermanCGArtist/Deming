@@ -371,7 +371,7 @@ pub(crate) fn select_affinity_mask(available_mask: usize, max_cores: usize) -> u
     let mut remaining = available_mask;
     let mut count = 0usize;
     while remaining != 0 && count < max_cores {
-        let lowest_bit = remaining & remaining.wrapping_neg();
+        let lowest_bit = remaining.isolate_lowest_one();
         selected |= lowest_bit;
         remaining &= !lowest_bit;
         count += 1;

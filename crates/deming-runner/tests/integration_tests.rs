@@ -474,7 +474,6 @@ async fn server_lifecycle_ready_pattern_and_client_timeout_on_windows() {
         timeout_secs: 1,
         extra_jvm_args: vec![],
         extra_game_args: vec!["/C".to_string(), client_bat.to_string_lossy().into_owned()],
-        cloak_window: false,
         on_pid: None,
     };
 
@@ -543,7 +542,6 @@ async fn client_on_pid_and_early_pass_log_pattern_terminates_before_timeout() {
         timeout_secs: 20,
         extra_jvm_args: vec![],
         extra_game_args: vec!["/C".to_string(), client_bat.to_string_lossy().into_owned()],
-        cloak_window: false,
         on_pid: Some(Arc::new(move |p| {
             *seen_pid_cb.lock().unwrap() = Some(p);
         })),
@@ -582,7 +580,7 @@ async fn client_on_pid_and_early_pass_log_pattern_terminates_before_timeout() {
 
 #[cfg(windows)]
 #[test]
-fn cloaked_layered_window_captures_nonzero_rgba_pixels() {
+fn window_capture_pid_to_png_writes_valid_nonzero_png() {
     use std::mem::zeroed;
     use std::ptr::null_mut;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -593,10 +591,9 @@ fn cloaked_layered_window_captures_nonzero_rgba_pixels() {
         BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, UpdateWindow, PAINTSTRUCT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
-        PeekMessageW, RegisterClassW, ShowWindow, TranslateMessage, GWL_EXSTYLE, MSG, PM_REMOVE,
-        SW_SHOWNOACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
+        RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOWNOACTIVATE, WM_PAINT,
+        WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     unsafe extern "system" fn test_wnd_proc(
@@ -637,7 +634,7 @@ fn cloaked_layered_window_captures_nonzero_rgba_pixels() {
     let (tx, rx) = mpsc::channel::<isize>();
 
     let handle = std::thread::spawn(move || {
-        let class_name: Vec<u16> = "DemingCloakCaptureTestWnd\0".encode_utf16().collect();
+        let class_name: Vec<u16> = "DemingPngCaptureTestWnd\0".encode_utf16().collect();
         let title: Vec<u16> = "Deming Capture Test\0".encode_utf16().collect();
 
         unsafe {
@@ -689,41 +686,30 @@ fn cloaked_layered_window_captures_nonzero_rgba_pixels() {
     std::thread::sleep(Duration::from_millis(60));
 
     let pid = std::process::id();
-    let updated = deming_runner::screenshot::cloak_and_hide_from_taskbar(pid, true)
-        .expect("cloak_and_hide_from_taskbar(true) should succeed");
-    assert!(updated >= 1, "expected at least 1 cloaked window, got {updated}");
-
-    let ex_style = unsafe { GetWindowLongPtrW(hwnd_raw as HWND, GWL_EXSTYLE) } as u32;
-    assert_ne!(ex_style & WS_EX_LAYERED, 0, "expected WS_EX_LAYERED set");
-    assert_ne!(ex_style & WS_EX_TOOLWINDOW, 0, "expected WS_EX_TOOLWINDOW set");
-    assert_ne!(ex_style & WS_EX_NOACTIVATE, 0, "expected WS_EX_NOACTIVATE set");
-    assert_ne!(ex_style & WS_EX_TRANSPARENT, 0, "expected WS_EX_TRANSPARENT set");
-    assert_eq!(ex_style & WS_EX_APPWINDOW, 0, "expected WS_EX_APPWINDOW cleared");
-
-    let (w, h, rgba) = deming_runner::screenshot::capture_pid_rgba(pid, 480)
-        .expect("capture_pid_rgba should succeed on layered cloaked window")
-        .expect("expected Some((w, h, rgba)) for cloaked window");
-    assert!(w > 0 && h > 0 && w <= 480, "unexpected frame dimensions {w}x{h}");
-    assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+    let windows = deming_runner::screenshot::find_windows_for_pid(pid);
     assert!(
-        rgba.chunks_exact(4)
+        windows.contains(&hwnd_raw),
+        "expected test window {hwnd_raw} in find_windows_for_pid({pid})"
+    );
+
+    let dir = temp_test_dir("win-png-capture");
+    let png_path = dir.join("frame.png");
+    deming_runner::screenshot::capture_pid_to_png(pid, &png_path)
+        .expect("capture_pid_to_png should succeed");
+    assert!(png_path.exists());
+
+    let img = image::open(&png_path)
+        .expect("captured PNG should decode")
+        .to_rgba8();
+    assert!(img.width() > 0 && img.height() > 0);
+    assert!(
+        img.as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0),
-        "expected captured cloaked window frame to contain non-zero RGB pixels"
+        "expected captured PNG to contain non-zero RGB pixels"
     );
 
-    let uncloaked = deming_runner::screenshot::cloak_and_hide_from_taskbar(pid, false)
-        .expect("cloak_and_hide_from_taskbar(false) should succeed");
-    assert!(uncloaked >= 1, "expected at least 1 uncloaked window, got {uncloaked}");
-
-    let ex_style_after = unsafe { GetWindowLongPtrW(hwnd_raw as HWND, GWL_EXSTYLE) } as u32;
-    assert_eq!(
-        ex_style_after & (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT),
-        0,
-        "expected cloak extended styles cleared on uncloak"
-    );
-    assert_ne!(
-        ex_style_after & WS_EX_APPWINDOW,
-        0,
-        "expected WS_EX_APPWINDOW restored on uncloak"
-    );
+    let _ = fs::remove_dir_all(&dir);
 }

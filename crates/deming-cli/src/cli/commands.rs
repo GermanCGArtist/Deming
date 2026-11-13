@@ -1,281 +1,25 @@
-//! Clap CLI definitions and command handlers for `deming`.
+//! CLI command dispatch and execution handlers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::CommandFactory;
 use deming_archive::{LogSearchFilter, RunArchiveReader};
 use deming_auth::{create_offline_account, AccountStore, MsaClient, StoredAccount};
-use deming_core::{DemingConfig, ModLoader, ProcessPriority, TestJobSpec};
+use deming_core::{DemingConfig, TestJobSpec};
 use deming_ipc::{IpcClient, IpcMessage};
 use deming_runner::AbortHandle;
 use serde_json::json;
 
+use super::args::{
+    AccountAction, AccountCommand, AddArgs, Cli, Commands, ConfigAction, ConfigCommand,
+    ConfigSetArgs, RunAction, RunCommand, SearchArgs, SyncArgs,
+};
 use crate::mcp;
-use crate::orchestrator::{
-    default_config_path, execute_job_with_ipc_options, DEFAULT_MSA_CLIENT_ID,
-};
-use crate::pack_ops::{
-    add_mod_to_manifest, resolve_default_manifest_path, search_mods, sync_manifest, SearchSource,
-};
-
-/// Deming: Pure Rust Minecraft Java Edition mod test orchestrator.
-#[derive(Debug, Parser)]
-#[command(name = "deming", version, about = "Minecraft Java Edition automated mod test runner")]
-pub struct Cli {
-    /// Emit machine-readable JSON output.
-    #[arg(long, global = true)]
-    pub json: bool,
-
-    /// Path to the Deming config JSON file.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    #[command(subcommand)]
-    pub command: Option<Commands>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Commands {
-    /// Inspect or update global Deming configuration.
-    Config(ConfigCommand),
-    /// Manage offline and Microsoft accounts.
-    Account(AccountCommand),
-    /// Submit, inspect, or abort test runs.
-    Run(RunCommand),
-    /// Search Modrinth or CurseForge for mods.
-    Search(SearchArgs),
-    /// Add a mod to a `deming.toml` or `mods.json` manifest.
-    Add(AddArgs),
-    /// Synchronize an instance's `mods/` directory and `deming.lock` with a manifest.
-    Sync(SyncArgs),
-    /// Launch the stdio JSON-RPC 2.0 MCP server.
-    Mcp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum LoaderArg {
-    Vanilla,
-    Fabric,
-    #[value(name = "neoforge")]
-    NeoForge,
-    Forge,
-    Quilt,
-}
-
-impl From<LoaderArg> for ModLoader {
-    fn from(value: LoaderArg) -> Self {
-        match value {
-            LoaderArg::Vanilla => ModLoader::Vanilla,
-            LoaderArg::Fabric => ModLoader::Fabric,
-            LoaderArg::NeoForge => ModLoader::NeoForge,
-            LoaderArg::Forge => ModLoader::Forge,
-            LoaderArg::Quilt => ModLoader::Quilt,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SourceArg {
-    Modrinth,
-    #[value(name = "curseforge")]
-    CurseForge,
-}
-
-impl From<SourceArg> for SearchSource {
-    fn from(value: SourceArg) -> Self {
-        match value {
-            SourceArg::Modrinth => SearchSource::Modrinth,
-            SourceArg::CurseForge => SearchSource::CurseForge,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-pub struct SearchArgs {
-    /// Search query string.
-    pub query: String,
-    /// Filter by Minecraft version (e.g. `1.21.4`).
-    #[arg(long)]
-    pub mc_version: Option<String>,
-    /// Filter by mod loader.
-    #[arg(long, value_enum)]
-    pub loader: Option<LoaderArg>,
-    /// Mod source provider.
-    #[arg(long, value_enum, default_value_t = SourceArg::Modrinth)]
-    pub source: SourceArg,
-    /// Maximum number of results to return.
-    #[arg(long, default_value_t = 10)]
-    pub limit: usize,
-}
-
-#[derive(Debug, Args)]
-pub struct AddArgs {
-    /// Modrinth project slug or ID to add.
-    pub slug: String,
-    /// Path to `deming.toml` or `mods.json`.
-    #[arg(long)]
-    pub manifest: Option<PathBuf>,
-    /// Target Minecraft version (used if creating or updating manifest).
-    #[arg(long)]
-    pub mc_version: Option<String>,
-    /// Target mod loader (used if creating or updating manifest).
-    #[arg(long, value_enum)]
-    pub loader: Option<LoaderArg>,
-    /// Optional pinned Modrinth version ID.
-    #[arg(long)]
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SyncArgs {
-    /// Path to `deming.toml` or `mods.json`.
-    #[arg(long)]
-    pub manifest: Option<PathBuf>,
-    /// Target instance directory containing `mods/` and `deming.lock`.
-    #[arg(long)]
-    pub instance: Option<PathBuf>,
-    /// Preview diff and lockfile without modifying disk.
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ConfigCommand {
-    #[command(subcommand)]
-    pub action: ConfigAction,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ConfigAction {
-    /// Print the current configuration.
-    Get,
-    /// Update configuration fields and persist to disk.
-    Set(ConfigSetArgs),
-}
-
-#[derive(Debug, Args, Default)]
-pub struct ConfigSetArgs {
-    /// Root workspace directory for caches, instances, servers, runs, and accounts.
-    #[arg(long)]
-    pub workspace: Option<PathBuf>,
-    /// Maximum combined RAM in MiB across concurrent instances.
-    #[arg(long)]
-    pub max_ram_mb: Option<u64>,
-    /// Maximum number of concurrent instances.
-    #[arg(long)]
-    pub max_concurrent: Option<usize>,
-    /// Default CPU cores per instance.
-    #[arg(long)]
-    pub cpu_cores: Option<usize>,
-    /// Default RAM in MiB per instance.
-    #[arg(long)]
-    pub default_ram_mb: Option<u64>,
-    /// OS process priority for launched JVMs.
-    #[arg(long, value_enum)]
-    pub priority: Option<PriorityArg>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum PriorityArg {
-    #[value(name = "below-normal")]
-    BelowNormal,
-    #[value(name = "normal")]
-    Normal,
-    #[value(name = "above-normal")]
-    AboveNormal,
-    #[value(name = "high")]
-    High,
-}
-
-impl From<PriorityArg> for ProcessPriority {
-    fn from(value: PriorityArg) -> Self {
-        match value {
-            PriorityArg::BelowNormal => ProcessPriority::BelowNormal,
-            PriorityArg::Normal => ProcessPriority::Normal,
-            PriorityArg::AboveNormal => ProcessPriority::AboveNormal,
-            PriorityArg::High => ProcessPriority::High,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-pub struct AccountCommand {
-    #[command(subcommand)]
-    pub action: AccountAction,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AccountAction {
-    /// List all stored accounts.
-    List,
-    /// Create and store a deterministic offline/dev account.
-    AddOffline {
-        /// Minecraft username (1-16 ASCII alphanumeric or underscore).
-        username: String,
-    },
-    /// Authenticate a Microsoft account via OAuth Device-Code flow.
-    LoginMsa {
-        /// Optional Azure/Xbox OAuth client ID override.
-        #[arg(long)]
-        client_id: Option<String>,
-    },
-    /// Remove a stored account by UUID.
-    Remove {
-        /// Account UUID to remove.
-        uuid: String,
-    },
-}
-
-#[derive(Debug, Args)]
-pub struct RunCommand {
-    #[command(subcommand)]
-    pub action: RunAction,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum RunAction {
-    /// Submit and execute a test job from a JSON specification file.
-    Submit {
-        /// Path to the TestJobSpec JSON file.
-        job_file: PathBuf,
-        /// Cloak launched Minecraft client windows (auto-enabled when connected to GUI).
-        #[arg(long)]
-        cloak: bool,
-    },
-    /// Show the manifest/status of a run.
-    Status {
-        /// Run UUID or run folder/archive name.
-        run_id: String,
-    },
-    /// Search or view logs from a run.
-    Logs {
-        /// Run UUID or run folder/archive name.
-        run_id: String,
-        /// Filter logs to a specific instance ID (or "server").
-        #[arg(long)]
-        instance: Option<String>,
-        /// Filter log lines using a regular expression.
-        #[arg(long)]
-        grep: Option<String>,
-    },
-    /// Capture or inspect screenshots for an instance in a run.
-    Screenshot {
-        /// Run UUID or run folder/archive name.
-        run_id: String,
-        /// Target instance ID.
-        instance_id: String,
-    },
-    /// Request abort of a specific run or all active runs via IPC.
-    Abort {
-        /// Optional run ID; aborts all runs if omitted.
-        run_id: Option<String>,
-    },
-    /// List archived and recent test runs.
-    List,
-}
+use crate::orchestrator::{default_config_path, execute_job_with_ipc, DEFAULT_MSA_CLIENT_ID};
+use crate::pack_ops::{add_mod_to_manifest, resolve_default_manifest_path, search_mods, sync_manifest};
 
 /// Applies [`ConfigSetArgs`] to a [`DemingConfig`].
 pub fn apply_config_updates(config: &mut DemingConfig, args: &ConfigSetArgs) {
@@ -394,7 +138,11 @@ async fn handle_account(cmd: AccountCommand, config: &DemingConfig, json_out: bo
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&stored)?);
             } else {
-                println!("Added offline account {} ({})", offline.username, offline.uuid_hyphenated());
+                println!(
+                    "Added offline account {} ({})",
+                    offline.username,
+                    offline.uuid_hyphenated()
+                );
             }
         }
         AccountAction::LoginMsa { client_id } => {
@@ -424,7 +172,10 @@ async fn handle_account(cmd: AccountCommand, config: &DemingConfig, json_out: bo
         AccountAction::Remove { uuid } => {
             let removed = store.remove_by_uuid(&uuid)?;
             if json_out {
-                println!("{}", serde_json::to_string_pretty(&json!({ "uuid": uuid, "removed": removed }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "uuid": uuid, "removed": removed }))?
+                );
             } else if removed {
                 println!("Removed account {uuid}");
             } else {
@@ -440,7 +191,7 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
     let reader = RunArchiveReader::new(config.runs_dir());
 
     match cmd.action {
-        RunAction::Submit { job_file, cloak } => {
+        RunAction::Submit { job_file } => {
             let raw = std::fs::read_to_string(&job_file)
                 .with_context(|| format!("failed to read job file {}", job_file.display()))?;
             let job: TestJobSpec = serde_json::from_str(&raw)
@@ -453,7 +204,7 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
                     let _ = abort_for_sig.abort();
                 }
             });
-            let manifest = execute_job_with_ipc_options(config, &job, abort, cloak).await?;
+            let manifest = execute_job_with_ipc(config, &job, abort).await?;
             sig_task.abort();
 
             if json_out {
@@ -527,11 +278,8 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
                             instance_id: instance_id.clone(),
                         })
                         .await;
-                    if let Ok(Some(IpcMessage::ScreenshotResult {
-                        path,
-                        error,
-                        ..
-                    })) = ipc.recv_timeout(Duration::from_secs(5)).await
+                    if let Ok(Some(IpcMessage::ScreenshotResult { path, error, .. })) =
+                        ipc.recv_timeout(Duration::from_secs(5)).await
                     {
                         if let Some(err) = error {
                             anyhow::bail!("screenshot capture failed: {err}");
@@ -628,7 +376,10 @@ async fn handle_search(args: SearchArgs, config: &DemingConfig, json_out: bool) 
         println!("No mods found matching '{}'.", args.query);
     } else {
         for h in hits {
-            println!("{} ({}) — {} [{} downloads]", h.title, h.slug, h.description, h.downloads);
+            println!(
+                "{} ({}) — {} [{} downloads]",
+                h.title, h.slug, h.description, h.downloads
+            );
         }
     }
     Ok(())

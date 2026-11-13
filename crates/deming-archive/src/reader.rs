@@ -132,7 +132,7 @@ impl RunArchiveReader {
             let id = manifest_id.or(extracted_id);
             let created_at = manifest_time.or(extracted_time).or_else(|| {
                 entry.metadata().ok().and_then(|meta| {
-                    meta.modified().ok().map(|sys_time| DateTime::<Utc>::from(sys_time))
+                    meta.modified().ok().map(DateTime::<Utc>::from)
                 })
             });
 
@@ -148,7 +148,7 @@ impl RunArchiveReader {
         }
 
         // Sort descending: newest runs first
-        runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        runs.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(runs)
     }
 

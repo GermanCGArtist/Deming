@@ -133,13 +133,13 @@ fn cli_parses_run_and_mcp_commands() {
         )
     ));
 
-    let submit_cloak = Cli::try_parse_from(["deming", "run", "submit", "job.json", "--cloak"])
-        .expect("parse run submit --cloak");
+    let submit = Cli::try_parse_from(["deming", "run", "submit", "job.json"])
+        .expect("parse run submit");
     assert!(matches!(
-        submit_cloak.command,
+        submit.command,
         Some(Commands::Run(r)) if matches!(
             r.action,
-            RunAction::Submit { ref job_file, cloak: true } if job_file == &PathBuf::from("job.json")
+            RunAction::Submit { ref job_file } if job_file == &PathBuf::from("job.json")
         )
     ));
 

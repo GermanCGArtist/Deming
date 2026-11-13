@@ -1,11 +1,11 @@
-//! Native Windows HWND screenshot capture by PID, DWM window cloaking, and `<instance>/screenshots/*.png` indexing.
+//! Native Windows HWND screenshot capture by PID and `<instance>/screenshots/*.png` indexing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use deming_core::{DemingError, Result};
-use image::{imageops::FilterType, RgbaImage};
+use image::RgbaImage;
 
 /// Indexes all `.png` screenshots inside `<instance_dir>/screenshots/`, sorted lexicographically.
 pub fn index_screenshots(instance_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -65,7 +65,7 @@ pub fn capture_instance_screenshot(
     Ok(output_path)
 }
 
-/// Returns a list of visible (including DWM-cloaked) non-zero-sized top-level window handles
+/// Returns a list of visible non-zero-sized top-level window handles
 /// (`isize`) owned by `pid`, ordered largest area first.
 #[cfg(windows)]
 pub fn find_windows_for_pid(pid: u32) -> Vec<isize> {
@@ -83,7 +83,7 @@ pub fn find_windows_for_pid(pid: u32) -> Vec<isize> {
         let state = &mut *(lparam as *mut EnumState);
         let mut window_pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &raw mut window_pid);
-        // IsWindowVisible checks WS_VISIBLE and remains true for DWM-cloaked windows.
+        // IsWindowVisible checks WS_VISIBLE.
         if window_pid == state.target_pid && IsWindowVisible(hwnd) != 0 {
             let mut rect: RECT = std::mem::zeroed();
             if GetWindowRect(hwnd, &raw mut rect) != 0 {
@@ -107,7 +107,7 @@ pub fn find_windows_for_pid(pid: u32) -> Vec<isize> {
     }
 
     // Prefer largest visible window first (main game window over tiny helper windows).
-    state.matches.sort_by(|a, b| b.1.cmp(&a.1));
+    state.matches.sort_by_key(|a| std::cmp::Reverse(a.1));
     state.matches.into_iter().map(|(h, _)| h).collect()
 }
 
@@ -115,145 +115,6 @@ pub fn find_windows_for_pid(pid: u32) -> Vec<isize> {
 #[cfg(not(windows))]
 pub fn find_windows_for_pid(_pid: u32) -> Vec<isize> {
     Vec::new()
-}
-
-fn uncloaked_pids() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
-    static UNCLOAKED_PIDS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<u32>>,
-    > = std::sync::OnceLock::new();
-    UNCLOAKED_PIDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-pub(crate) fn is_pid_uncloaked(pid: u32) -> bool {
-    uncloaked_pids()
-        .lock()
-        .map(|set| set.contains(&pid))
-        .unwrap_or(false)
-}
-
-/// Cloaks (`cloak = true`) or uncloaks (`cloak = false`) all top-level windows belonging to `pid`
-/// using `WS_EX_LAYERED` (`LWA_ALPHA = 1`) + `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`
-/// + `EnableWindow(hwnd, 0)` so cloaked windows remain visually invisible, off the taskbar/Alt-Tab,
-/// and unable to steal focus or lock the mouse while keeping DWM/OpenGL rendering active for `PrintWindow`.
-///
-/// Returns the number of matching top-level windows updated.
-#[cfg(windows)]
-pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        ClipCursor, GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, PostMessageW,
-        SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-        GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, WM_ACTIVATE, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-    };
-
-    if let Ok(mut set) = uncloaked_pids().lock() {
-        if cloak {
-            set.remove(&pid);
-        } else {
-            set.insert(pid);
-        }
-    }
-
-    let windows = find_windows_for_pid(pid);
-    if windows.is_empty() {
-        return Ok(0);
-    }
-
-    let mut updated = 0usize;
-    for hwnd_raw in windows {
-        let hwnd = hwnd_raw as HWND;
-        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as usize;
-        let cloak_flags =
-            (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
-
-        if cloak {
-            let new_style = (ex_style | cloak_flags) & !(WS_EX_APPWINDOW as usize);
-            unsafe {
-                EnableWindow(hwnd, 0);
-                if ex_style != new_style {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-                    SetWindowPos(
-                        hwnd,
-                        null_mut(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                    );
-                }
-            }
-            // Alpha = 1/255 keeps the window visually invisible while keeping DWM/OpenGL
-            // surface composition active for PrintWindow(PW_RENDERFULLCONTENT).
-            let layered_ok = unsafe { SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA) } != 0;
-            unsafe {
-                if GetForegroundWindow() == hwnd {
-                    PostMessageW(hwnd, WM_ACTIVATE, 0, 0);
-                    let shell = GetShellWindow();
-                    if shell != null_mut() {
-                        SetForegroundWindow(shell);
-                    }
-                }
-                ClipCursor(null_mut());
-            }
-            if layered_ok {
-                updated += 1;
-            }
-        } else {
-            let new_style = (ex_style & !cloak_flags) | (WS_EX_APPWINDOW as usize);
-            unsafe {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
-                EnableWindow(hwnd, 1);
-                SetForegroundWindow(hwnd);
-            }
-            updated += 1;
-        }
-    }
-
-    Ok(updated)
-}
-
-/// Non-Windows stub returning `Ok(0)`.
-#[cfg(not(windows))]
-pub fn cloak_and_hide_from_taskbar(_pid: u32, _cloak: bool) -> Result<usize> {
-    Ok(0)
-}
-
-/// Captures the largest visible (or cloaked) window belonging to `pid` and returns
-/// `(width, height, rgba_bytes)` downscaled proportionally so `width <= max_width` (when `max_width > 0`).
-///
-/// Returns `Ok(None)` when `pid` currently has no visible top-level window.
-#[cfg(windows)]
-pub fn capture_pid_rgba(pid: u32, max_width: u32) -> Result<Option<(u32, u32, Vec<u8>)>> {
-    use windows_sys::Win32::Foundation::HWND;
-
-    let windows = find_windows_for_pid(pid);
-    let Some(hwnd_raw) = windows.into_iter().next() else {
-        return Ok(None);
-    };
-
-    let (width, height, rgba) = capture_hwnd_rgba(hwnd_raw as HWND, pid)?;
-    let scaled = downscale_rgba(width, height, rgba, max_width)?;
-    Ok(Some(scaled))
-}
-
-/// Non-Windows stub returning `Ok(None)`.
-#[cfg(not(windows))]
-pub fn capture_pid_rgba(_pid: u32, _max_width: u32) -> Result<Option<(u32, u32, Vec<u8>)>> {
-    Ok(None)
 }
 
 /// Captures the largest visible window belonging to `pid` and saves it as a PNG at `output_path`.
@@ -385,7 +246,7 @@ fn capture_hwnd_rgba(
         scanlines != 0
     };
 
-    // Try PrintWindow with PW_RENDERFULLCONTENT first (works on DWM-cloaked windows);
+    // Try PrintWindow with PW_RENDERFULLCONTENT first;
     // fall back to standard PrintWindow / BitBlt if capture fails or produces an all-zero buffer.
     let mut dib_ok = unsafe { PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) } != 0
         && read_dib(&mut rgba_bytes)
@@ -418,7 +279,7 @@ fn capture_hwnd_rgba(
     }
 
     // Convert BGRA -> RGBA and normalize opaque alpha for captured desktop windows.
-    for px in rgba_bytes.chunks_exact_mut(4) {
+    for px in rgba_bytes.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         px[3] = 255;
     }
@@ -426,58 +287,20 @@ fn capture_hwnd_rgba(
     Ok((width as u32, height as u32, rgba_bytes))
 }
 
-/// Proportionally downscales an RGBA buffer so its width does not exceed `max_width`
-/// (unless `max_width == 0`, which disables scaling).
-pub(crate) fn downscale_rgba(
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-    max_width: u32,
-) -> Result<(u32, u32, Vec<u8>)> {
-    if max_width == 0 || width <= max_width || width == 0 || height == 0 {
-        return Ok((width, height, rgba));
-    }
-
-    let new_width = max_width;
-    let new_height = ((height as u64 * max_width as u64) / width as u64).max(1) as u32;
-    let img = RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
-        DemingError::Other("invalid RGBA buffer length for downscaling".to_string())
-    })?;
-    let resized = image::imageops::resize(&img, new_width, new_height, FilterType::Triangle);
-    Ok((new_width, new_height, resized.into_raw()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn downscale_rgba_scales_proportionally_and_skips_when_within_limit() {
-        let src = vec![255u8; 800 * 600 * 4];
-
-        // Within limit -> unchanged dimensions and buffer.
-        let (w, h, buf) = downscale_rgba(800, 600, src.clone(), 800).unwrap();
-        assert_eq!((w, h), (800, 600));
-        assert_eq!(buf.len(), 800 * 600 * 4);
-
-        // Zero max_width -> scaling disabled.
-        let (w, h, buf) = downscale_rgba(800, 600, src.clone(), 0).unwrap();
-        assert_eq!((w, h), (800, 600));
-        assert_eq!(buf.len(), 800 * 600 * 4);
-
-        // Downscale 800x600 -> max_width 320 => 320x240.
-        let (w, h, buf) = downscale_rgba(800, 600, src, 320).unwrap();
-        assert_eq!((w, h), (320, 240));
-        assert_eq!(buf.len(), 320 * 240 * 4);
-    }
-
     #[cfg(windows)]
     #[test]
-    fn cloak_and_capture_return_gracefully_for_nonexistent_pid() {
+    fn find_and_capture_return_gracefully_for_nonexistent_pid() {
         // PID u32::MAX - 1 will not match any running window.
         let nonexistent_pid = u32::MAX - 1;
-        assert_eq!(cloak_and_hide_from_taskbar(nonexistent_pid, true).unwrap(), 0);
-        assert_eq!(cloak_and_hide_from_taskbar(nonexistent_pid, false).unwrap(), 0);
-        assert!(capture_pid_rgba(nonexistent_pid, 640).unwrap().is_none());
+        assert!(find_windows_for_pid(nonexistent_pid).is_empty());
+        let out = std::env::temp_dir().join(format!(
+            "deming-nonexistent-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(capture_pid_to_png(nonexistent_pid, &out).is_err());
     }
 }

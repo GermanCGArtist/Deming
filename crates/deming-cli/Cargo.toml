@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 deming-core = { path = "../deming-core" }
+deming-engine = { path = "../deming-engine" }
 deming-fetch = { path = "../deming-fetch" }
 deming-auth = { path = "../deming-auth" }
 deming-runner = { path = "../deming-runner" }

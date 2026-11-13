@@ -1340,6 +1340,7 @@ dependencies = [
  "deming-archive",
  "deming-auth",
  "deming-core",
+ "deming-engine",
  "deming-fetch",
  "deming-gui",
  "deming-ipc",
@@ -1362,6 +1363,23 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "toml",
+ "uuid",
+]
+
+[[package]]
+name = "deming-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "deming-archive",
+ "deming-auth",
+ "deming-core",
+ "deming-fetch",
+ "deming-ipc",
+ "deming-runner",
+ "dirs 6.0.0",
+ "tokio",
  "uuid",
 ]
 
@@ -1391,6 +1409,7 @@ dependencies = [
  "deming-archive",
  "deming-auth",
  "deming-core",
+ "deming-engine",
  "deming-fetch",
  "deming-ipc",
  "deming-runner",

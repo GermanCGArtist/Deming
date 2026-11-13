@@ -210,10 +210,9 @@ impl IpcServer {
 
     /// Receives the next incoming [`IpcMessage`] with a timeout.
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Option<IpcMessage> {
-        match tokio::time::timeout(timeout, self.recv()).await {
-            Ok(msg) => msg,
-            Err(_) => None,
-        }
+        tokio::time::timeout(timeout, self.recv())
+            .await
+            .unwrap_or_default()
     }
 
     /// Explicitly stops the server and deletes the port file.

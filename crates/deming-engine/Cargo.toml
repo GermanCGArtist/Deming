@@ -1,0 +1,19 @@
+[package]
+name = "deming-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared Minecraft server and client test job orchestration engine for Deming CLI, MCP, and GUI."
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+deming-archive = { path = "../deming-archive" }
+deming-auth = { path = "../deming-auth" }
+deming-core = { path = "../deming-core" }
+deming-fetch = { path = "../deming-fetch" }
+deming-ipc = { path = "../deming-ipc" }
+deming-runner = { path = "../deming-runner" }
+dirs = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

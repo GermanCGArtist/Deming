@@ -106,12 +106,12 @@ pub async fn sync_instance_mods(
         next_mods.clone(),
     );
 
-    let (added, updated, removed, unchanged) = compute_diff(previous.as_ref(), &next_mods);
+    let diff = compute_diff(previous.as_ref(), &next_mods);
     let plan = SyncPlan {
-        added,
-        updated,
-        removed,
-        unchanged,
+        added: diff.added,
+        updated: diff.updated,
+        removed: diff.removed,
+        unchanged: diff.unchanged,
         lockfile: new_lockfile.clone(),
     };
 
@@ -291,15 +291,14 @@ async fn resolve_source_for_sync(
     }
 }
 
-fn compute_diff(
-    previous: Option<&DemingLockfile>,
-    next_mods: &[LockedMod],
-) -> (
-    Vec<LockedMod>,
-    Vec<(LockedMod, LockedMod)>,
-    Vec<LockedMod>,
-    Vec<LockedMod>,
-) {
+struct DiffResult {
+    added: Vec<LockedMod>,
+    updated: Vec<(LockedMod, LockedMod)>,
+    removed: Vec<LockedMod>,
+    unchanged: Vec<LockedMod>,
+}
+
+fn compute_diff(previous: Option<&DemingLockfile>, next_mods: &[LockedMod]) -> DiffResult {
     let mut prev_by_key: BTreeMap<(String, String), LockedMod> = BTreeMap::new();
     if let Some(prev) = previous {
         for m in &prev.mods {
@@ -328,7 +327,12 @@ fn compute_diff(
     }
 
     let removed: Vec<LockedMod> = prev_by_key.into_values().collect();
-    (added, updated, removed, unchanged)
+    DiffResult {
+        added,
+        updated,
+        removed,
+        unchanged,
+    }
 }
 
 #[cfg(test)]

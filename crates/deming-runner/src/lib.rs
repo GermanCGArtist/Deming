@@ -17,8 +17,7 @@ pub use client::{
 pub use evaluator::{evaluate_rule, EvaluationContext, EvaluationResult};
 pub use scheduler::{AbortHandle, ResourcePermit, ResourceScheduler};
 pub use screenshot::{
-    capture_instance_screenshot, capture_pid_rgba, capture_pid_to_png,
-    cloak_and_hide_from_taskbar, find_windows_for_pid, index_screenshots,
+    capture_instance_screenshot, capture_pid_to_png, find_windows_for_pid, index_screenshots,
 };
 pub use server::{pick_free_port, write_eula, write_server_properties, ServerLaunchConfig, ServerProcess};
 pub use win_job::{configure_pid, configure_tokio_child, set_cpu_affinity_and_priority, JobHandle};

@@ -12,6 +12,7 @@ deming-auth = { path = "../deming-auth" }
 deming-runner = { path = "../deming-runner" }
 deming-archive = { path = "../deming-archive" }
 deming-ipc = { path = "../deming-ipc" }
+deming-engine = { path = "../deming-engine" }
 
 eframe = "0.31"
 egui = "0.31"

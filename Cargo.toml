@@ -7,6 +7,7 @@ members = [
     "crates/deming-runner",
     "crates/deming-archive",
     "crates/deming-ipc",
+    "crates/deming-engine",
     "crates/deming-cli",
     "crates/deming-gui",
 ]
