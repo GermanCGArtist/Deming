@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use deming_core::{DemingError, Result};
+#[cfg(windows)]
 use image::RgbaImage;
 
 /// Indexes all `.png` screenshots inside `<instance_dir>/screenshots/`, sorted lexicographically.

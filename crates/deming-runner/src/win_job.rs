@@ -2,7 +2,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use deming_core::{DemingError, ProcessPriority, Result};
+#[cfg(windows)]
+use deming_core::DemingError;
+use deming_core::{ProcessPriority, Result};
 
 /// RAII wrapper around an OS process containment group (Windows Job Object).
 ///
@@ -363,6 +365,7 @@ pub fn configure_pid(
 }
 
 /// Selects up to `max_cores` lowest-index set bits from `available_mask`.
+#[cfg(any(windows, test))]
 pub(crate) fn select_affinity_mask(available_mask: usize, max_cores: usize) -> usize {
     if max_cores == 0 || available_mask == 0 {
         return 0;
