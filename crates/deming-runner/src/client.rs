@@ -387,8 +387,11 @@ pub async fn run_client(
         pid.map(|target_pid| {
             tokio::spawn(async move {
                 let start = tokio::time::Instant::now();
-                let max_watch = Duration::from_secs(30);
-                while start.elapsed() < max_watch {
+                let fast_poll_window = Duration::from_secs(30);
+                while start.elapsed() < fast_poll_window {
+                    if crate::screenshot::is_pid_uncloaked(target_pid) {
+                        break;
+                    }
                     if let Ok(updated) =
                         crate::screenshot::cloak_and_hide_from_taskbar(target_pid, true)
                     {
@@ -396,7 +399,16 @@ pub async fn run_client(
                             break;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                // Periodically re-assert cloak, disabled input, focus yield, and ClipCursor(NULL)
+                // unless the user explicitly uncloaked the window.
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if !crate::screenshot::is_pid_uncloaked(target_pid) {
+                        let _ = crate::screenshot::cloak_and_hide_from_taskbar(target_pid, true);
+                    }
                 }
             })
         })

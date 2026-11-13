@@ -122,17 +122,41 @@ pub fn find_windows_for_pid(_pid: u32) -> Vec<isize> {
 /// hidden from the desktop, taskbar, and Alt-Tab while still renderable via `PrintWindow`.
 ///
 /// Returns the number of matching top-level windows updated.
+fn uncloaked_pids() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
+    static UNCLOAKED_PIDS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<u32>>,
+    > = std::sync::OnceLock::new();
+    UNCLOAKED_PIDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn is_pid_uncloaked(pid: u32) -> bool {
+    uncloaked_pids()
+        .lock()
+        .map(|set| set.contains(&pid))
+        .unwrap_or(false)
+}
+
 #[cfg(windows)]
 pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
     use std::mem::size_of;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
+        ClipCursor, GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, PostMessageW,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_ACTIVATE, WS_EX_APPWINDOW,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
+
+    if let Ok(mut set) = uncloaked_pids().lock() {
+        if cloak {
+            set.remove(&pid);
+        } else {
+            set.insert(pid);
+        }
+    }
 
     let windows = find_windows_for_pid(pid);
     if windows.is_empty() {
@@ -143,22 +167,24 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
     for hwnd_raw in windows {
         let hwnd = hwnd_raw as HWND;
         let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as usize;
+        let cloak_flags = (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
 
         if cloak {
-            let cloak_flags =
-                (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
             let new_style = (ex_style | cloak_flags) & !(WS_EX_APPWINDOW as usize);
             unsafe {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    -32_000,
-                    -32_000,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
+                EnableWindow(hwnd, 0);
+                if ex_style != new_style {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
             }
             let cloak_val: u32 = 1;
             let hr = unsafe {
@@ -169,6 +195,16 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
                     size_of::<u32>() as u32,
                 )
             };
+            unsafe {
+                if GetForegroundWindow() == hwnd {
+                    PostMessageW(hwnd, WM_ACTIVATE, 0, 0);
+                    let shell = GetShellWindow();
+                    if shell != null_mut() {
+                        SetForegroundWindow(shell);
+                    }
+                }
+                ClipCursor(null_mut());
+            }
             if hr >= 0 {
                 updated += 1;
             }
@@ -182,20 +218,21 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
                     size_of::<u32>() as u32,
                 )
             };
-            let cloak_flags =
-                (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
             let new_style = (ex_style & !cloak_flags) | (WS_EX_APPWINDOW as usize);
             unsafe {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    100,
-                    100,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
+                if ex_style != new_style {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                    );
+                }
+                EnableWindow(hwnd, 1);
                 SetForegroundWindow(hwnd);
             }
             if hr >= 0 {
@@ -342,39 +379,45 @@ fn capture_hwnd_rgba(
 
     let old_obj = unsafe { SelectObject(mem_dc, bitmap) };
 
-    // Try PrintWindow with PW_RENDERFULLCONTENT first (works on DWM-cloaked windows);
-    // fall back to standard PrintWindow / BitBlt if needed.
-    let mut captured = unsafe { PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) } != 0;
-    if !captured {
-        captured = unsafe { PrintWindow(hwnd, mem_dc, 0) } != 0;
-    }
-    if !captured {
-        captured = unsafe { BitBlt(mem_dc, 0, 0, width, height, wnd_dc, 0, 0, SRCCOPY) } != 0;
-    }
-
     let mut rgba_bytes = vec![0u8; (width as usize) * (height as usize) * 4];
-    let mut dib_ok = false;
-    if captured {
-        let mut bmi: BITMAPINFO = unsafe { zeroed() };
-        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -height; // top-down DIB
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bmi: BITMAPINFO = unsafe { zeroed() };
+    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height; // top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
+    let mut read_dib = |buf: &mut [u8]| -> bool {
         let scanlines = unsafe {
             GetDIBits(
                 mem_dc,
                 bitmap,
                 0,
                 height as u32,
-                rgba_bytes.as_mut_ptr().cast(),
+                buf.as_mut_ptr().cast(),
                 &raw mut bmi,
                 DIB_RGB_COLORS,
             )
         };
-        dib_ok = scanlines != 0;
+        scanlines != 0
+    };
+
+    // Try PrintWindow with PW_RENDERFULLCONTENT first (works on DWM-cloaked windows);
+    // fall back to standard PrintWindow / BitBlt if capture fails or produces an all-zero buffer.
+    let mut dib_ok = unsafe { PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) } != 0
+        && read_dib(&mut rgba_bytes)
+        && rgba_bytes.iter().any(|&b| b != 0);
+
+    if !dib_ok {
+        dib_ok = unsafe { PrintWindow(hwnd, mem_dc, 0) } != 0
+            && read_dib(&mut rgba_bytes)
+            && rgba_bytes.iter().any(|&b| b != 0);
+    }
+
+    if !dib_ok {
+        dib_ok = unsafe { BitBlt(mem_dc, 0, 0, width, height, wnd_dc, 0, 0, SRCCOPY) } != 0
+            && read_dib(&mut rgba_bytes);
     }
 
     // Cleanup all GDI resources before converting/returning.
@@ -385,7 +428,7 @@ fn capture_hwnd_rgba(
         ReleaseDC(hwnd, wnd_dc);
     }
 
-    if !captured || !dib_ok {
+    if !dib_ok {
         return Err(DemingError::Process(format!(
             "failed to capture window contents for PID {pid}: {}",
             std::io::Error::last_os_error()
