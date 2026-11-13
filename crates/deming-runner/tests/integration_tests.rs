@@ -579,3 +579,151 @@ async fn client_on_pid_and_early_pass_log_pattern_terminates_before_timeout() {
 
     let _ = fs::remove_dir_all(&client_dir);
 }
+
+#[cfg(windows)]
+#[test]
+fn cloaked_layered_window_captures_nonzero_rgba_pixels() {
+    use std::mem::zeroed;
+    use std::ptr::null_mut;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread::JoinHandle;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, UpdateWindow, PAINTSTRUCT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
+        PeekMessageW, RegisterClassW, ShowWindow, TranslateMessage, GWL_EXSTYLE, MSG, PM_REMOVE,
+        SW_SHOWNOACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+
+    unsafe extern "system" fn test_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_PAINT {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let hdc = BeginPaint(hwnd, &raw mut ps);
+            // Solid bright orange/blue BGR fill so captured pixels are guaranteed non-zero RGB.
+            let brush = CreateSolidBrush(0x00FF_8822);
+            FillRect(hdc, &raw const ps.rcPaint, brush);
+            DeleteObject(brush);
+            EndPaint(hwnd, &raw const ps);
+            return 0;
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    struct WindowGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let (tx, rx) = mpsc::channel::<isize>();
+
+    let handle = std::thread::spawn(move || {
+        let class_name: Vec<u16> = "DemingCloakCaptureTestWnd\0".encode_utf16().collect();
+        let title: Vec<u16> = "Deming Capture Test\0".encode_utf16().collect();
+
+        unsafe {
+            let mut wc: WNDCLASSW = zeroed();
+            wc.lpfnWndProc = Some(test_wnd_proc);
+            wc.lpszClassName = class_name.as_ptr();
+            RegisterClassW(&raw const wc);
+
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                120,
+                120,
+                320,
+                240,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null(), "CreateWindowExW failed");
+
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            let _ = tx.send(hwnd as isize);
+
+            let mut msg: MSG = zeroed();
+            while !stop_thread.load(Ordering::Acquire) {
+                while PeekMessageW(&raw mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            DestroyWindow(hwnd);
+        }
+    });
+
+    let _guard = WindowGuard {
+        stop,
+        handle: Some(handle),
+    };
+
+    let hwnd_raw = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("test window should be created");
+    std::thread::sleep(Duration::from_millis(60));
+
+    let pid = std::process::id();
+    let updated = deming_runner::screenshot::cloak_and_hide_from_taskbar(pid, true)
+        .expect("cloak_and_hide_from_taskbar(true) should succeed");
+    assert!(updated >= 1, "expected at least 1 cloaked window, got {updated}");
+
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd_raw as HWND, GWL_EXSTYLE) } as u32;
+    assert_ne!(ex_style & WS_EX_LAYERED, 0, "expected WS_EX_LAYERED set");
+    assert_ne!(ex_style & WS_EX_TOOLWINDOW, 0, "expected WS_EX_TOOLWINDOW set");
+    assert_ne!(ex_style & WS_EX_NOACTIVATE, 0, "expected WS_EX_NOACTIVATE set");
+    assert_ne!(ex_style & WS_EX_TRANSPARENT, 0, "expected WS_EX_TRANSPARENT set");
+    assert_eq!(ex_style & WS_EX_APPWINDOW, 0, "expected WS_EX_APPWINDOW cleared");
+
+    let (w, h, rgba) = deming_runner::screenshot::capture_pid_rgba(pid, 480)
+        .expect("capture_pid_rgba should succeed on layered cloaked window")
+        .expect("expected Some((w, h, rgba)) for cloaked window");
+    assert!(w > 0 && h > 0 && w <= 480, "unexpected frame dimensions {w}x{h}");
+    assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0),
+        "expected captured cloaked window frame to contain non-zero RGB pixels"
+    );
+
+    let uncloaked = deming_runner::screenshot::cloak_and_hide_from_taskbar(pid, false)
+        .expect("cloak_and_hide_from_taskbar(false) should succeed");
+    assert!(uncloaked >= 1, "expected at least 1 uncloaked window, got {uncloaked}");
+
+    let ex_style_after = unsafe { GetWindowLongPtrW(hwnd_raw as HWND, GWL_EXSTYLE) } as u32;
+    assert_eq!(
+        ex_style_after & (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT),
+        0,
+        "expected cloak extended styles cleared on uncloak"
+    );
+    assert_ne!(
+        ex_style_after & WS_EX_APPWINDOW,
+        0,
+        "expected WS_EX_APPWINDOW restored on uncloak"
+    );
+}

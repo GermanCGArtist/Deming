@@ -117,11 +117,6 @@ pub fn find_windows_for_pid(_pid: u32) -> Vec<isize> {
     Vec::new()
 }
 
-/// Cloaks (`cloak = true`) or uncloaks (`cloak = false`) all top-level windows belonging to `pid`
-/// using `DWMWA_CLOAK` and toggles `WS_EX_TOOLWINDOW` / `WS_EX_APPWINDOW` so cloaked windows are
-/// hidden from the desktop, taskbar, and Alt-Tab while still renderable via `PrintWindow`.
-///
-/// Returns the number of matching top-level windows updated.
 fn uncloaked_pids() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
     static UNCLOAKED_PIDS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<u32>>,
@@ -136,18 +131,23 @@ pub(crate) fn is_pid_uncloaked(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Cloaks (`cloak = true`) or uncloaks (`cloak = false`) all top-level windows belonging to `pid`
+/// using `WS_EX_LAYERED` (`LWA_ALPHA = 1`) + `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`
+/// + `EnableWindow(hwnd, 0)` so cloaked windows remain visually invisible, off the taskbar/Alt-Tab,
+/// and unable to steal focus or lock the mouse while keeping DWM/OpenGL rendering active for `PrintWindow`.
+///
+/// Returns the number of matching top-level windows updated.
 #[cfg(windows)]
 pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
-    use std::mem::size_of;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         ClipCursor, GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, PostMessageW,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_ACTIVATE, WS_EX_APPWINDOW,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+        GWL_EXSTYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, WM_ACTIVATE, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
     if let Ok(mut set) = uncloaked_pids().lock() {
@@ -167,7 +167,8 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
     for hwnd_raw in windows {
         let hwnd = hwnd_raw as HWND;
         let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as usize;
-        let cloak_flags = (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
+        let cloak_flags =
+            (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
 
         if cloak {
             let new_style = (ex_style | cloak_flags) & !(WS_EX_APPWINDOW as usize);
@@ -186,15 +187,9 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
                     );
                 }
             }
-            let cloak_val: u32 = 1;
-            let hr = unsafe {
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_CLOAK as u32,
-                    (&raw const cloak_val).cast(),
-                    size_of::<u32>() as u32,
-                )
-            };
+            // Alpha = 1/255 keeps the window visually invisible while keeping DWM/OpenGL
+            // surface composition active for PrintWindow(PW_RENDERFULLCONTENT).
+            let layered_ok = unsafe { SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA) } != 0;
             unsafe {
                 if GetForegroundWindow() == hwnd {
                     PostMessageW(hwnd, WM_ACTIVATE, 0, 0);
@@ -205,39 +200,26 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
                 }
                 ClipCursor(null_mut());
             }
-            if hr >= 0 {
+            if layered_ok {
                 updated += 1;
             }
         } else {
-            let cloak_val: u32 = 0;
-            let hr = unsafe {
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_CLOAK as u32,
-                    (&raw const cloak_val).cast(),
-                    size_of::<u32>() as u32,
-                )
-            };
             let new_style = (ex_style & !cloak_flags) | (WS_EX_APPWINDOW as usize);
             unsafe {
-                if ex_style != new_style {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-                    SetWindowPos(
-                        hwnd,
-                        null_mut(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                    );
-                }
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
                 EnableWindow(hwnd, 1);
                 SetForegroundWindow(hwnd);
             }
-            if hr >= 0 {
-                updated += 1;
-            }
+            updated += 1;
         }
     }
 
