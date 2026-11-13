@@ -1,4 +1,4 @@
-//! Dashboard tab: STOP / ABORT ALL, live run cards, cloaked MC live renders, progress bars, and live log drawer.
+//! Dashboard tab: STOP / ABORT ALL, live run cards, progress bars, and live log drawer.
 
 use std::time::Duration;
 
@@ -15,38 +15,13 @@ use crate::theme::{
 };
 
 pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
-    // Poll ~3 FPS live frames for active cloaked instances while Dashboard is visible.
-    let active_capture_targets: Vec<(String, String, u32)> = state
-        .dashboard
-        .runs
-        .iter()
-        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Pending))
-        .flat_map(|r| {
-            r.instances.iter().filter_map(move |inst| {
-                let active = matches!(
-                    inst.state,
-                    InstanceState::Starting | InstanceState::Running
-                );
-                if active {
-                    inst.pid
-                        .map(|pid| (r.run_id.clone(), inst.instance_id.clone(), pid))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-
     let has_active_runs = state
         .dashboard
         .runs
         .iter()
         .any(|r| matches!(r.status, RunStatus::Running | RunStatus::Pending));
 
-    if state.dashboard.show_live_renders && !active_capture_targets.is_empty() {
-        bridge.request_live_frames_if_due(&active_capture_targets);
-        ui.ctx().request_repaint_after(Duration::from_millis(333));
-    } else if has_active_runs {
+    if has_active_runs {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
@@ -114,17 +89,10 @@ pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
                         .dashboard
                         .runs
                         .retain(|r| matches!(r.status, RunStatus::Running | RunStatus::Pending));
-                    state.dashboard.prune_live_frames();
                 }
                 if ui.add(primary_button("+ New Test Run")).clicked() {
                     state.active_tab = ActiveTab::TestBuilder;
                 }
-                ui.separator();
-                ui.add_enabled(
-                    state.dashboard.show_live_renders,
-                    egui::Checkbox::new(&mut state.dashboard.live_renders_grid, "Grid View"),
-                );
-                ui.checkbox(&mut state.dashboard.show_live_renders, "Live Renders");
             });
         });
     });
@@ -265,12 +233,6 @@ fn render_run_card(
             return;
         }
 
-        // Optional Live Renders Grid across active instances
-        if state.dashboard.show_live_renders && state.dashboard.live_renders_grid {
-            render_live_renders_grid(ui, run, state, bridge);
-            ui.add_space(8.0);
-        }
-
         for inst in &run.instances {
             render_instance_card(ui, run, inst, state, bridge);
             ui.add_space(4.0);
@@ -299,88 +261,6 @@ fn render_setup_progress_bar(ui: &mut egui::Ui, label_prefix: &str, prog: &Progr
             .desired_height(14.0)
             .text(bar_text),
     );
-}
-
-fn render_live_renders_grid(
-    ui: &mut egui::Ui,
-    run: &LiveRunCard,
-    state: &UiState,
-    bridge: &GuiBridge,
-) {
-    let active_instances: Vec<&LiveInstanceState> = run
-        .instances
-        .iter()
-        .filter(|i| {
-            i.pid.is_some()
-                || state
-                    .dashboard
-                    .live_frame_textures
-                    .contains_key(&(run.run_id.clone(), i.instance_id.clone()))
-        })
-        .collect();
-
-    if active_instances.is_empty() {
-        return;
-    }
-
-    let cols = ((ui.available_width() / 260.0).floor() as usize).clamp(1, 4);
-    sub_card_frame().show(ui, |ui| {
-        ui.label(
-            RichText::new("Live Cloaked Renders")
-                .size(12.5)
-                .strong()
-                .color(ACCENT_EMERALD),
-        );
-        ui.add_space(4.0);
-
-        for chunk in active_instances.chunks(cols) {
-            ui.columns(cols, |ui_cols| {
-                for (col_idx, inst) in chunk.iter().enumerate() {
-                    let col_ui = &mut ui_cols[col_idx];
-                    col_ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(&inst.instance_id)
-                                    .strong()
-                                    .size(12.0)
-                                    .color(TEXT_PRIMARY),
-                            );
-                            let (badge_txt, badge_col) = instance_state_badge(inst.state);
-                            status_badge(ui, badge_txt, badge_col);
-                            if let Some(pid) = inst.pid {
-                                if matches!(
-                                    inst.state,
-                                    InstanceState::Starting | InstanceState::Running
-                                ) && ui.small_button("Focus / Uncloak").clicked()
-                                {
-                                    bridge.uncloak_instance(inst.instance_id.clone(), pid);
-                                }
-                            }
-                        });
-                        if let Some(tex) = state
-                            .dashboard
-                            .live_frame_textures
-                            .get(&(run.run_id.clone(), inst.instance_id.clone()))
-                        {
-                            ui.add(
-                                egui::Image::from_texture(tex)
-                                    .max_width(240.0)
-                                    .corner_radius(egui::CornerRadius::same(4)),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("Waiting for first window frame...")
-                                    .size(11.0)
-                                    .italics()
-                                    .color(TEXT_MUTED),
-                            );
-                        }
-                    });
-                }
-            });
-            ui.add_space(6.0);
-        }
-    });
 }
 
 fn render_instance_card(
@@ -447,19 +327,6 @@ fn render_instance_card(
                     bridge.request_screenshot(&run.run_id, &inst.instance_id);
                 }
 
-                if let Some(pid) = inst.pid {
-                    if ui
-                        .add_enabled(
-                            matches!(inst.state, InstanceState::Starting | InstanceState::Running),
-                            egui::Button::new("Focus / Uncloak"),
-                        )
-                        .on_hover_text("Uncloak this hidden Minecraft window and show it on desktop/taskbar")
-                        .clicked()
-                    {
-                        bridge.uncloak_instance(inst.instance_id.clone(), pid);
-                    }
-                }
-
                 if ui
                     .add_enabled(is_active, danger_button("Kill"))
                     .on_hover_text("Terminate this instance immediately")
@@ -511,22 +378,6 @@ fn render_instance_card(
         } else if let Some(ref msg) = inst.status_message {
             ui.add_space(3.0);
             ui.label(RichText::new(msg).size(11.5).color(TEXT_MUTED));
-        }
-
-        // Embedded Live Cloaked Render inside instance card (unless Grid View is active)
-        if state.dashboard.show_live_renders && !state.dashboard.live_renders_grid {
-            if let Some(tex) = state
-                .dashboard
-                .live_frame_textures
-                .get(&(run.run_id.clone(), inst.instance_id.clone()))
-            {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Image::from_texture(tex)
-                        .max_width(360.0)
-                        .corner_radius(egui::CornerRadius::same(6)),
-                );
-            }
         }
     });
 }

@@ -79,7 +79,7 @@ impl DemingApp {
         }
     }
 
-    fn process_bridge_messages(&mut self, ctx: &egui::Context) {
+    fn process_bridge_messages(&mut self) {
         let messages = self.bridge.drain_messages();
         for msg in messages {
             match msg {
@@ -152,41 +152,6 @@ impl DemingApp {
                         });
                     }
                 }
-                BridgeMessage::LiveFrameCaptured {
-                    run_id,
-                    instance_id,
-                    width,
-                    height,
-                    rgba,
-                } => {
-                    self.state.dashboard.apply_live_frame(
-                        ctx,
-                        &run_id,
-                        &instance_id,
-                        width,
-                        height,
-                        &rgba,
-                    );
-                }
-                BridgeMessage::InstanceUncloaked {
-                    instance_id,
-                    result,
-                } => match result {
-                    Ok(()) => {
-                        self.state.toast = Some(StatusToast {
-                            is_error: false,
-                            text: format!("Restored window for {instance_id} to desktop"),
-                            created_at: Utc::now(),
-                        });
-                    }
-                    Err(err) => {
-                        self.state.toast = Some(StatusToast {
-                            is_error: true,
-                            text: format!("Failed to uncloak {instance_id}: {err}"),
-                            created_at: Utc::now(),
-                        });
-                    }
-                },
                 BridgeMessage::LocalRunFinished { run_id, result } => {
                     let id_str = run_id.to_string();
                     match result {
@@ -431,7 +396,7 @@ impl eframe::App for DemingApp {
             self.theme_applied = true;
         }
 
-        self.process_bridge_messages(ctx);
+        self.process_bridge_messages();
 
         // Top Navigation Bar
         egui::TopBottomPanel::top("deming_top_nav")

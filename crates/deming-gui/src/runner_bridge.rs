@@ -1,6 +1,6 @@
 //! Background Tokio runtime, IPC server bridge, local job executor, and MSA login tasks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -21,9 +21,8 @@ use deming_fetch::{
 };
 use deming_ipc::{IpcBroadcaster, IpcMessage, IpcServer};
 use deming_runner::{
-    capture_instance_screenshot, capture_pid_rgba, cloak_and_hide_from_taskbar, evaluate_rule,
-    index_screenshots, run_client, AbortHandle, ClientLaunchConfig, EvaluationContext,
-    ResourceScheduler, ServerLaunchConfig, ServerProcess,
+    capture_instance_screenshot, evaluate_rule, index_screenshots, run_client, AbortHandle,
+    ClientLaunchConfig, EvaluationContext, ResourceScheduler, ServerLaunchConfig, ServerProcess,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -84,17 +83,6 @@ pub enum BridgeMessage {
         path: Option<String>,
         error: Option<String>,
     },
-    LiveFrameCaptured {
-        run_id: String,
-        instance_id: String,
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
-    },
-    InstanceUncloaked {
-        instance_id: String,
-        result: Result<(), String>,
-    },
     LocalRunFinished {
         run_id: Uuid,
         result: Result<RunManifest, String>,
@@ -129,8 +117,6 @@ pub struct GuiBridge {
     ipc_shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     local_runs: Arc<Mutex<HashMap<String, LocalRunControl>>>,
     msa_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    live_capture_inflight: Arc<Mutex<HashSet<(String, String)>>>,
-    live_capture_last: Arc<Mutex<HashMap<(String, String), Instant>>>,
     egui_ctx: Arc<Mutex<Option<egui::Context>>>,
 }
 
@@ -152,8 +138,6 @@ impl GuiBridge {
             ipc_shutdown: Arc::new(Mutex::new(None)),
             local_runs: Arc::new(Mutex::new(HashMap::new())),
             msa_cancel: Arc::new(Mutex::new(None)),
-            live_capture_inflight: Arc::new(Mutex::new(HashSet::new())),
-            live_capture_last: Arc::new(Mutex::new(HashMap::new())),
             egui_ctx: Arc::new(Mutex::new(None)),
         }
     }
@@ -597,86 +581,6 @@ impl GuiBridge {
                     );
                 }
             }
-        });
-    }
-
-    /// Requests ~3 FPS RGBA frame captures for the given `(run_id, instance_id, pid)` targets
-    /// when their cooldown (`333ms`) has elapsed and no capture is currently in flight.
-    pub fn request_live_frames_if_due(&self, targets: &[(String, String, u32)]) {
-        const FRAME_INTERVAL: Duration = Duration::from_millis(333);
-        let now = Instant::now();
-
-        for (run_id, instance_id, pid) in targets {
-            let key = (run_id.clone(), instance_id.clone());
-
-            let should_skip_time = self
-                .live_capture_last
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&key).copied())
-                .map(|last| now.duration_since(last) < FRAME_INTERVAL)
-                .unwrap_or(false);
-            if should_skip_time {
-                continue;
-            }
-
-            {
-                let Ok(mut inflight) = self.live_capture_inflight.lock() else {
-                    continue;
-                };
-                if !inflight.insert(key.clone()) {
-                    continue;
-                }
-            }
-            if let Ok(mut last_map) = self.live_capture_last.lock() {
-                last_map.insert(key.clone(), now);
-            }
-
-            let ui_tx = self.ui_tx.clone();
-            let egui_ctx = Arc::clone(&self.egui_ctx);
-            let inflight_arc = Arc::clone(&self.live_capture_inflight);
-            let r_id = run_id.clone();
-            let i_id = instance_id.clone();
-            let target_pid = *pid;
-
-            self.runtime.spawn_blocking(move || {
-                let res = capture_pid_rgba(target_pid, 480);
-                if let Ok(mut inflight) = inflight_arc.lock() {
-                    inflight.remove(&(r_id.clone(), i_id.clone()));
-                }
-                if let Ok(Some((width, height, rgba))) = res {
-                    emit_ui(
-                        &ui_tx,
-                        &egui_ctx,
-                        BridgeMessage::LiveFrameCaptured {
-                            run_id: r_id,
-                            instance_id: i_id,
-                            width,
-                            height,
-                            rgba,
-                        },
-                    );
-                }
-            });
-        }
-    }
-
-    /// Uncloaks a running Minecraft instance window and restores it to the desktop/taskbar.
-    pub fn uncloak_instance(&self, instance_id: String, pid: u32) {
-        let ui_tx = self.ui_tx.clone();
-        let egui_ctx = Arc::clone(&self.egui_ctx);
-        self.runtime.spawn_blocking(move || {
-            let res = cloak_and_hide_from_taskbar(pid, false)
-                .map(|_| ())
-                .map_err(|e| e.to_string());
-            emit_ui(
-                &ui_tx,
-                &egui_ctx,
-                BridgeMessage::InstanceUncloaked {
-                    instance_id,
-                    result: res,
-                },
-            );
         });
     }
 
@@ -1726,7 +1630,7 @@ async fn run_single_instance(
         timeout_secs,
         extra_jvm_args,
         extra_game_args,
-        cloak_window: true,
+        cloak_window: false,
         on_pid: Some(on_pid),
     };
 

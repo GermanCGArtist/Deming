@@ -328,14 +328,12 @@ fn push_bounded(buf: &mut Vec<String>, line: String) {
 }
 
 /// State for the Dashboard tab.
+#[derive(Debug, Clone)]
 pub struct DashboardState {
     pub runs: Vec<LiveRunCard>,
     pub selected_log_target: Option<(String, String)>,
     pub log_filter: String,
     pub auto_scroll_logs: bool,
-    pub show_live_renders: bool,
-    pub live_renders_grid: bool,
-    pub live_frame_textures: HashMap<(String, String), egui::TextureHandle>,
 }
 
 impl Default for DashboardState {
@@ -345,51 +343,7 @@ impl Default for DashboardState {
             selected_log_target: None,
             log_filter: String::new(),
             auto_scroll_logs: true,
-            show_live_renders: true,
-            live_renders_grid: false,
-            live_frame_textures: HashMap::new(),
         }
-    }
-}
-
-impl DashboardState {
-    /// Creates or updates the [`egui::TextureHandle`] for a live cloaked instance render.
-    ///
-    /// Returns `false` if the dimensions/buffer length are invalid.
-    pub fn apply_live_frame(
-        &mut self,
-        ctx: &egui::Context,
-        run_id: &str,
-        instance_id: &str,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) -> bool {
-        let expected = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(4);
-        if width == 0 || height == 0 || rgba.len() != expected {
-            return false;
-        }
-        let color_img =
-            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba);
-        let key = (run_id.to_string(), instance_id.to_string());
-        if let Some(handle) = self.live_frame_textures.get_mut(&key) {
-            handle.set(color_img, egui::TextureOptions::LINEAR);
-        } else {
-            let tex_name = format!("live_frame_{run_id}_{instance_id}");
-            let handle = ctx.load_texture(tex_name, color_img, egui::TextureOptions::LINEAR);
-            self.live_frame_textures.insert(key, handle);
-        }
-        true
-    }
-
-    /// Drops cached live frame textures for runs that are no longer present in `self.runs`.
-    pub fn prune_live_frames(&mut self) {
-        let valid_runs: std::collections::HashSet<&str> =
-            self.runs.iter().map(|r| r.run_id.as_str()).collect();
-        self.live_frame_textures
-            .retain(|(run_id, _), _| valid_runs.contains(run_id.as_str()));
     }
 }
 
@@ -793,39 +747,5 @@ mod tests {
             &cfg.global_limits,
         );
         assert!(card.server_progress.is_none());
-    }
-
-    #[test]
-    fn dashboard_apply_live_frame_creates_and_updates_texture() {
-        let mut dash = DashboardState::default();
-        let ctx = egui::Context::default();
-
-        // Reject mismatched buffer size
-        assert!(!dash.apply_live_frame(&ctx, "run-1", "inst-1", 2, 2, &[0u8; 4]));
-
-        let rgba1 = vec![255u8; 2 * 2 * 4];
-        assert!(dash.apply_live_frame(&ctx, "run-1", "inst-1", 2, 2, &rgba1));
-        let first_id = dash
-            .live_frame_textures
-            .get(&("run-1".to_string(), "inst-1".to_string()))
-            .expect("texture handle inserted")
-            .id();
-        assert_eq!(
-            dash.live_frame_textures
-                .get(&("run-1".to_string(), "inst-1".to_string()))
-                .unwrap()
-                .size(),
-            [2, 2]
-        );
-
-        // Subsequent frame updates the existing TextureHandle in-place (same TextureId)
-        let rgba2 = vec![128u8; 4 * 3 * 4];
-        assert!(dash.apply_live_frame(&ctx, "run-1", "inst-1", 4, 3, &rgba2));
-        let handle = dash
-            .live_frame_textures
-            .get(&("run-1".to_string(), "inst-1".to_string()))
-            .unwrap();
-        assert_eq!(handle.id(), first_id);
-        assert_eq!(handle.size(), [4, 3]);
     }
 }
