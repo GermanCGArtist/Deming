@@ -475,6 +475,7 @@ async fn server_lifecycle_ready_pattern_and_client_timeout_on_windows() {
         extra_jvm_args: vec![],
         extra_game_args: vec!["/C".to_string(), client_bat.to_string_lossy().into_owned()],
         cloak_window: false,
+        on_pid: None,
     };
 
     let outcome = run_client(client_cfg, &abort, Some(tx))
@@ -485,5 +486,96 @@ async fn server_lifecycle_ready_pattern_and_client_timeout_on_windows() {
     assert!(outcome.combined_logs.iter().any(|l| l.contains("booting client")));
 
     let _ = fs::remove_dir_all(&server_dir);
+    let _ = fs::remove_dir_all(&client_dir);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn client_on_pid_and_early_pass_log_pattern_terminates_before_timeout() {
+    use std::sync::{Arc, Mutex};
+
+    let client_dir = temp_test_dir("win-client-early");
+    let client_bat = client_dir.join("early_pass.bat");
+    fs::write(
+        &client_bat,
+        "@echo off\r\necho Sound engine started\r\nping -n 30 127.0.0.1 >nul\r\n",
+    )
+    .unwrap();
+
+    let abort = AbortHandle::new();
+    let seen_pid = Arc::new(Mutex::new(None::<u32>));
+    let seen_pid_cb = Arc::clone(&seen_pid);
+
+    let rule = TestCompletionRule::LogPattern {
+        success_regex: "Sound engine started".to_string(),
+        failure_regex: Some("FATAL".to_string()),
+    };
+
+    let client_cfg = ClientLaunchConfig {
+        run_id: Uuid::new_v4(),
+        java_exe: PathBuf::from("cmd.exe"),
+        instance_dir: client_dir.clone(),
+        spec: InstanceSpec {
+            id: "client-early-pass".to_string(),
+            mc_version: "26.1.1".to_string(),
+            loader: ModLoader::Vanilla,
+            loader_version: None,
+            mods: vec![],
+            account: AccountRef::Offline {
+                username: "Tester".to_string(),
+            },
+            ram_mb: Some(1024),
+            cpu_cores: Some(1),
+            jvm_args: vec![],
+            game_args: vec![],
+            test_rule: rule.clone(),
+        },
+        main_class: None,
+        classpath: vec![],
+        natives_dir: None,
+        assets_dir: None,
+        asset_index: None,
+        access_token: None,
+        ram_mb: 1024,
+        cpu_cores: Some(1),
+        priority: ProcessPriority::BelowNormal,
+        connect_server: None,
+        timeout_secs: 20,
+        extra_jvm_args: vec![],
+        extra_game_args: vec!["/C".to_string(), client_bat.to_string_lossy().into_owned()],
+        cloak_window: false,
+        on_pid: Some(Arc::new(move |p| {
+            *seen_pid_cb.lock().unwrap() = Some(p);
+        })),
+    };
+
+    let start = Instant::now();
+    let outcome = run_client(client_cfg, &abort, None)
+        .await
+        .expect("run_client should finish cleanly on early pass");
+    let elapsed = start.elapsed();
+
+    assert!(!outcome.timed_out);
+    assert!(!outcome.aborted);
+    assert_eq!(*seen_pid.lock().unwrap(), outcome.pid);
+    assert!(outcome.pid.is_some());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "expected early termination well before 20s timeout, took {elapsed:?}"
+    );
+
+    let eval = evaluate_rule(
+        &rule,
+        &EvaluationContext {
+            exit_code: outcome.exit_code,
+            timed_out: outcome.timed_out,
+            aborted: outcome.aborted,
+            logs: outcome.combined_logs.clone(),
+            instance_dir: client_dir.clone(),
+        },
+    )
+    .unwrap();
+    assert!(eval.passed, "expected Passed: true, got: {}", eval.reason);
+
     let _ = fs::remove_dir_all(&client_dir);
 }

@@ -20,6 +20,7 @@ deming-auth = { path = "../deming-auth" }
 deming-runner = { path = "../deming-runner" }
 deming-archive = { path = "../deming-archive" }
 deming-ipc = { path = "../deming-ipc" }
+deming-gui = { path = "../deming-gui" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

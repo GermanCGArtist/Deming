@@ -259,6 +259,51 @@ pub fn maven_coord_to_path(coord: &str) -> Option<String> {
     Some(format!("{group}/{artifact}/{version}/{filename}"))
 }
 
+/// Returns the content-addressable blob path `<cache_dir>/blobs/sha256/<sha256>.jar`.
+pub fn blob_sha256_path(cache_dir: &Path, sha256: &str) -> PathBuf {
+    cache_dir
+        .join("blobs")
+        .join("sha256")
+        .join(format!("{sha256}.jar"))
+}
+
+/// Populates `dest` from `src` using a filesystem hardlink, falling back to a file copy
+/// if hardlinking fails (e.g., across different filesystems/drives).
+pub fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if dest.exists() {
+        std::fs::remove_file(dest)?;
+    }
+    if std::fs::hard_link(src, dest).is_err() {
+        std::fs::copy(src, dest)?;
+    }
+    Ok(())
+}
+
+/// Ensures `src_path` is stored in the content-addressable blob store at
+/// `<cache_dir>/blobs/sha256/<sha256>.jar` and returns the blob path.
+pub async fn store_blob_sha256(cache_dir: &Path, src_path: &Path, sha256: &str) -> Result<PathBuf> {
+    let blob_path = blob_sha256_path(cache_dir, sha256);
+    if verify_sha256(&blob_path, sha256)? {
+        if src_path != blob_path && src_path.exists() {
+            let _ = tokio::fs::remove_file(src_path).await;
+        }
+        return Ok(blob_path);
+    }
+    if let Some(parent) = blob_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if tokio::fs::rename(src_path, &blob_path).await.is_err() {
+        tokio::fs::copy(src_path, &blob_path).await?;
+        let _ = tokio::fs::remove_file(src_path).await;
+    }
+    Ok(blob_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

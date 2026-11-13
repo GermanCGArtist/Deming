@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use deming_archive::{LogSearchFilter, RunArchiveReader};
 use deming_auth::{create_offline_account, AccountStore, MsaClient, StoredAccount};
-use deming_core::{DemingConfig, ProcessPriority, TestJobSpec};
+use deming_core::{DemingConfig, ModLoader, ProcessPriority, TestJobSpec};
 use deming_ipc::{IpcClient, IpcMessage};
 use deming_runner::AbortHandle;
 use serde_json::json;
@@ -16,6 +16,9 @@ use serde_json::json;
 use crate::mcp;
 use crate::orchestrator::{
     default_config_path, execute_job_with_ipc_options, DEFAULT_MSA_CLIENT_ID,
+};
+use crate::pack_ops::{
+    add_mod_to_manifest, resolve_default_manifest_path, search_mods, sync_manifest, SearchSource,
 };
 
 /// Deming: Pure Rust Minecraft Java Edition mod test orchestrator.
@@ -31,7 +34,7 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -42,8 +45,101 @@ pub enum Commands {
     Account(AccountCommand),
     /// Submit, inspect, or abort test runs.
     Run(RunCommand),
+    /// Search Modrinth or CurseForge for mods.
+    Search(SearchArgs),
+    /// Add a mod to a `deming.toml` or `mods.json` manifest.
+    Add(AddArgs),
+    /// Synchronize an instance's `mods/` directory and `deming.lock` with a manifest.
+    Sync(SyncArgs),
     /// Launch the stdio JSON-RPC 2.0 MCP server.
     Mcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoaderArg {
+    Vanilla,
+    Fabric,
+    #[value(name = "neoforge")]
+    NeoForge,
+    Forge,
+    Quilt,
+}
+
+impl From<LoaderArg> for ModLoader {
+    fn from(value: LoaderArg) -> Self {
+        match value {
+            LoaderArg::Vanilla => ModLoader::Vanilla,
+            LoaderArg::Fabric => ModLoader::Fabric,
+            LoaderArg::NeoForge => ModLoader::NeoForge,
+            LoaderArg::Forge => ModLoader::Forge,
+            LoaderArg::Quilt => ModLoader::Quilt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SourceArg {
+    Modrinth,
+    #[value(name = "curseforge")]
+    CurseForge,
+}
+
+impl From<SourceArg> for SearchSource {
+    fn from(value: SourceArg) -> Self {
+        match value {
+            SourceArg::Modrinth => SearchSource::Modrinth,
+            SourceArg::CurseForge => SearchSource::CurseForge,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Search query string.
+    pub query: String,
+    /// Filter by Minecraft version (e.g. `1.21.4`).
+    #[arg(long)]
+    pub mc_version: Option<String>,
+    /// Filter by mod loader.
+    #[arg(long, value_enum)]
+    pub loader: Option<LoaderArg>,
+    /// Mod source provider.
+    #[arg(long, value_enum, default_value_t = SourceArg::Modrinth)]
+    pub source: SourceArg,
+    /// Maximum number of results to return.
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Modrinth project slug or ID to add.
+    pub slug: String,
+    /// Path to `deming.toml` or `mods.json`.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Target Minecraft version (used if creating or updating manifest).
+    #[arg(long)]
+    pub mc_version: Option<String>,
+    /// Target mod loader (used if creating or updating manifest).
+    #[arg(long, value_enum)]
+    pub loader: Option<LoaderArg>,
+    /// Optional pinned Modrinth version ID.
+    #[arg(long)]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Path to `deming.toml` or `mods.json`.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Target instance directory containing `mods/` and `deming.lock`.
+    #[arg(long)]
+    pub instance: Option<PathBuf>,
+    /// Preview diff and lockfile without modifying disk.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -207,17 +303,26 @@ pub fn apply_config_updates(config: &mut DemingConfig, args: &ConfigSetArgs) {
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
-    if matches!(cli.command, Commands::Mcp) {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    if matches!(command, Commands::Mcp) {
         return mcp::run_stdio(config_path).await;
     }
 
     let mut config = DemingConfig::load_or_default(&config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
-    match cli.command {
+    match command {
         Commands::Config(cmd) => handle_config(cmd, &mut config, &config_path, cli.json)?,
         Commands::Account(cmd) => handle_account(cmd, &config, cli.json).await?,
         Commands::Run(cmd) => handle_run(cmd, &config, cli.json).await?,
+        Commands::Search(args) => handle_search(args, &config, cli.json).await?,
+        Commands::Add(args) => handle_add(args, cli.json)?,
+        Commands::Sync(args) => handle_sync(args, &config, cli.json).await?,
         Commands::Mcp => unreachable!(),
     }
 
@@ -503,5 +608,75 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
         }
     }
 
+    Ok(())
+}
+
+async fn handle_search(args: SearchArgs, config: &DemingConfig, json_out: bool) -> Result<()> {
+    let hits = search_mods(
+        config,
+        &args.query,
+        args.mc_version.as_deref(),
+        args.loader.map(Into::into),
+        args.source.into(),
+        args.limit,
+    )
+    .await?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+    } else if hits.is_empty() {
+        println!("No mods found matching '{}'.", args.query);
+    } else {
+        for h in hits {
+            println!("{} ({}) — {} [{} downloads]", h.title, h.slug, h.description, h.downloads);
+        }
+    }
+    Ok(())
+}
+
+fn handle_add(args: AddArgs, json_out: bool) -> Result<()> {
+    let manifest_path = resolve_default_manifest_path(args.manifest);
+    let manifest = add_mod_to_manifest(
+        &manifest_path,
+        &args.slug,
+        args.mc_version.as_deref(),
+        args.loader.map(Into::into),
+        args.version_id.as_deref(),
+    )?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+    } else {
+        println!(
+            "Updated {} ({} mods, MC {}, {:?})",
+            manifest_path.display(),
+            manifest.mods.len(),
+            manifest.mc_version,
+            manifest.loader
+        );
+    }
+    Ok(())
+}
+
+async fn handle_sync(args: SyncArgs, config: &DemingConfig, json_out: bool) -> Result<()> {
+    let manifest_path = resolve_default_manifest_path(args.manifest);
+    let instance_dir = args
+        .instance
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let plan = sync_manifest(config, &manifest_path, &instance_dir, args.dry_run, None).await?;
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        let prefix = if args.dry_run { "[dry-run] " } else { "" };
+        println!(
+            "{}Sync complete: +{} added, ~{} updated, -{} removed, {} unchanged",
+            prefix,
+            plan.added.len(),
+            plan.updated.len(),
+            plan.removed.len(),
+            plan.unchanged.len()
+        );
+    }
     Ok(())
 }

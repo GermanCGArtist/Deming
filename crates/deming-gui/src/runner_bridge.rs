@@ -10,12 +10,14 @@ use chrono::Utc;
 use deming_archive::{apply_retention, RunArchiveWriter};
 use deming_auth::{AccountStore, DeviceCodePrompt, MsaClient, MsaSession, StoredAccount};
 use deming_core::{
-    AccountRef, DemingConfig, InstanceResult, InstanceSpec, InstanceState, ModLoader, RunEvent,
-    RunManifest, RunStatus, TestJobSpec,
+    AccountRef, DemingConfig, DemingLockfile, InstanceResult, InstanceSpec, InstanceState,
+    LockedMod, ModLoader, ModSource, ModsManifest, RunEvent, RunManifest, RunStatus, TestJobSpec,
 };
 use deming_fetch::{
-    ensure_java_runtime_with_progress, resolve_and_install_loader_with_progress,
-    resolve_mods_with_progress, LaunchProfile, LoaderSide, ModrinthClient, ProgressCallback,
+    ensure_java_runtime_with_progress, export_mrpack, import_curseforge_zip, import_mrpack,
+    link_or_copy, resolve_and_install_loader_with_progress, resolve_mods_with_progress,
+    sync_instance_mods, CurseForgeClient, LaunchProfile, LoaderSide, ModrinthClient,
+    ProgressCallback, SyncPlan,
 };
 use deming_ipc::{IpcBroadcaster, IpcMessage, IpcServer};
 use deming_runner::{
@@ -44,6 +46,16 @@ pub fn default_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("deming")
         .join("config.json")
+}
+
+/// Summary payload emitted when a `.mrpack` or CurseForge `.zip` modpack is imported.
+#[derive(Debug, Clone)]
+pub struct ImportedPackPayload {
+    pub pack_name: String,
+    pub manifest: ModsManifest,
+    pub lockfile: Option<DemingLockfile>,
+    pub summary: String,
+    pub warnings: Vec<String>,
 }
 
 /// Messages sent from background Tokio tasks to the egui UI thread.
@@ -91,6 +103,12 @@ pub enum BridgeMessage {
     MsaLoginFinished(Result<MsaSession, String>),
     MsaBrowserLoginFinished(Result<MsaSession, String>),
     MsaPopupLoginFinished(Result<MsaSession, String>),
+    ModpackImported(Result<ImportedPackPayload, String>),
+    ModpackExported(Result<PathBuf, String>),
+    ModsSynced {
+        dry_run: bool,
+        result: Result<SyncPlan, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +674,236 @@ impl GuiBridge {
                 &egui_ctx,
                 BridgeMessage::InstanceUncloaked {
                     instance_id,
+                    result: res,
+                },
+            );
+        });
+    }
+
+    /// Imports a `.mrpack` or CurseForge `.zip` modpack asynchronously and reports the resulting
+    /// [`ModsManifest`] + [`DemingLockfile`] (plus any CurseForge resolution warnings).
+    pub fn import_modpack(&self, config: DemingConfig, path: PathBuf) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+
+        self.runtime.spawn(async move {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported-pack")
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let dest_dir = config.workspace_dir.join("packs").join(&stem);
+            let is_mrpack = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("mrpack"))
+                .unwrap_or(false);
+
+            let res: Result<ImportedPackPayload, String> = if is_mrpack {
+                import_mrpack(&path, &dest_dir, &config.cache_dir(), None)
+                    .await
+                    .map(|(manifest, lockfile)| {
+                        let summary = format!(
+                            "Imported .mrpack '{}' ({} {:?}, {} mods)",
+                            stem,
+                            manifest.mc_version,
+                            manifest.loader,
+                            lockfile.mods.len()
+                        );
+                        ImportedPackPayload {
+                            pack_name: stem,
+                            manifest,
+                            lockfile: Some(lockfile),
+                            summary,
+                            warnings: Vec::new(),
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            } else {
+                match import_curseforge_zip(&path, Some(&dest_dir)) {
+                    Ok(pack) => {
+                        let mut warnings = Vec::new();
+                        let mut locked_mods: Vec<LockedMod> = Vec::new();
+                        let mut mod_sources: Vec<ModSource> = Vec::new();
+
+                        if !pack.files.is_empty() {
+                            match CurseForgeClient::from_config(&config) {
+                                Ok(cf) => {
+                                    let mods_dir = dest_dir.join("mods");
+                                    let _ = std::fs::create_dir_all(&mods_dir);
+                                    for f in &pack.files {
+                                        match cf
+                                            .resolve_mod(
+                                                f.project_id,
+                                                Some(f.file_id),
+                                                &pack.mc_version,
+                                                pack.loader,
+                                                &config.cache_dir(),
+                                            )
+                                            .await
+                                        {
+                                            Ok((locked, blob_path)) => {
+                                                let target = mods_dir.join(&locked.filename);
+                                                if let Err(e) = link_or_copy(&blob_path, &target) {
+                                                    warnings.push(format!(
+                                                        "Failed linking {} ({}): {e}",
+                                                        locked.filename, f.project_id
+                                                    ));
+                                                } else {
+                                                    mod_sources.push(ModSource::LocalPath(target));
+                                                    locked_mods.push(locked);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warnings.push(format!(
+                                                    "CurseForge mod {}/{} failed: {e}",
+                                                    f.project_id, f.file_id
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warnings.push(format!(
+                                        "{} CurseForge mod(s) skipped — set CurseForge API Key in Settings to download ({e}).",
+                                        pack.files.len()
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Include any JAR overrides extracted into dest_dir/mods
+                        let override_mods_dir = dest_dir.join("mods");
+                        if let Ok(rd) = std::fs::read_dir(&override_mods_dir) {
+                            for entry in rd.flatten() {
+                                let p = entry.path();
+                                if p.is_file()
+                                    && p.extension()
+                                        .and_then(|s| s.to_str())
+                                        .map(|s| s.eq_ignore_ascii_case("jar"))
+                                        .unwrap_or(false)
+                                {
+                                    let src = ModSource::LocalPath(p);
+                                    if !mod_sources.contains(&src) {
+                                        mod_sources.push(src);
+                                    }
+                                }
+                            }
+                        }
+
+                        let lockfile = if locked_mods.is_empty() {
+                            None
+                        } else {
+                            Some(DemingLockfile::new(
+                                pack.mc_version.clone(),
+                                pack.loader,
+                                pack.loader_version.clone(),
+                                locked_mods,
+                            ))
+                        };
+                        let manifest = ModsManifest {
+                            mc_version: pack.mc_version.clone(),
+                            loader: pack.loader,
+                            loader_version: pack.loader_version.clone(),
+                            mods: mod_sources,
+                        };
+                        let summary = format!(
+                            "Imported CurseForge pack '{}' v{} ({} {:?}, {} mods, {} overrides)",
+                            pack.name,
+                            pack.version,
+                            pack.mc_version,
+                            pack.loader,
+                            manifest.mods.len(),
+                            pack.overrides_extracted
+                        );
+                        Ok(ImportedPackPayload {
+                            pack_name: pack.name,
+                            manifest,
+                            lockfile,
+                            summary,
+                            warnings,
+                        })
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+
+            emit_ui(&ui_tx, &egui_ctx, BridgeMessage::ModpackImported(res));
+        });
+    }
+
+    /// Exports a `.mrpack` bundle from the given [`ModsManifest`] and optional cached [`DemingLockfile`].
+    pub fn export_mrpack_async(
+        &self,
+        config: DemingConfig,
+        manifest: ModsManifest,
+        existing_lockfile: Option<DemingLockfile>,
+        out_path: PathBuf,
+    ) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+
+        self.runtime.spawn(async move {
+            let lockfile_res: Result<DemingLockfile, String> = match existing_lockfile {
+                Some(lf)
+                    if lf.mc_version == manifest.mc_version
+                        && lf.loader == manifest.loader
+                        && lf.mods.len() == manifest.mods.len() =>
+                {
+                    Ok(lf)
+                }
+                _ => {
+                    let stage_dir = config
+                        .workspace_dir
+                        .join(".tmp_export")
+                        .join(Uuid::new_v4().to_string());
+                    let synced = sync_instance_mods(&config, &manifest, &stage_dir, false, None)
+                        .await
+                        .map(|plan| plan.lockfile)
+                        .map_err(|e| e.to_string());
+                    let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                    synced
+                }
+            };
+
+            let res = match lockfile_res {
+                Ok(lockfile) => export_mrpack(&manifest, &lockfile, None, &out_path)
+                    .map(|()| out_path)
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            emit_ui(&ui_tx, &egui_ctx, BridgeMessage::ModpackExported(res));
+        });
+    }
+
+    /// Runs [`sync_instance_mods`] (`dry_run = true` or `false`) for the target instance directory.
+    pub fn sync_instance_mods_async(
+        &self,
+        config: DemingConfig,
+        manifest: ModsManifest,
+        instance_dir: PathBuf,
+        dry_run: bool,
+    ) {
+        let ui_tx = self.ui_tx.clone();
+        let egui_ctx = Arc::clone(&self.egui_ctx);
+
+        self.runtime.spawn(async move {
+            let res = sync_instance_mods(&config, &manifest, &instance_dir, dry_run, None)
+                .await
+                .map_err(|e| e.to_string());
+            emit_ui(
+                &ui_tx,
+                &egui_ctx,
+                BridgeMessage::ModsSynced {
+                    dry_run,
                     result: res,
                 },
             );
@@ -1448,6 +1696,18 @@ async fn run_single_instance(
     let (extra_jvm_args, extra_game_args) =
         sanitize_launch_profile_args(&profile, &inst_dir, spec.loader);
 
+    let pid_ev_tx = ev_tx.clone();
+    let pid_inst_id = spec.id.clone();
+    let on_pid: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |pid| {
+        let _ = pid_ev_tx.send(RunEvent::InstanceStateChanged {
+            run_id,
+            instance_id: pid_inst_id.clone(),
+            state: InstanceState::Running,
+            message: Some(format!("pid={pid}")),
+            timestamp: Utc::now(),
+        });
+    });
+
     let launch_cfg = ClientLaunchConfig {
         run_id,
         java_exe: java_rt.executable,
@@ -1467,6 +1727,7 @@ async fn run_single_instance(
         extra_jvm_args,
         extra_game_args,
         cloak_window: true,
+        on_pid: Some(on_pid),
     };
 
     let outcome = match run_client(launch_cfg, &inst_abort, Some(ev_tx.clone())).await {
@@ -1704,8 +1965,17 @@ fn sanitize_launch_profile_args(
     (jvm_out, game_out)
 }
 
-/// Parses `"running (pid 12345)"` emitted by `deming-runner::client`.
+/// Parses `"pid=12345"` or `"running (pid 12345)"` emitted by `deming-runner::client`.
 pub fn parse_pid_from_message(msg: &str) -> Option<u32> {
+    if let Some(idx) = msg.find("pid=") {
+        let digits: String = msg[idx + 4..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(pid) = digits.parse::<u32>() {
+            return Some(pid);
+        }
+    }
     let marker = "(pid ";
     let start = msg.find(marker)? + marker.len();
     let rest = &msg[start..];

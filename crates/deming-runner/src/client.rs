@@ -1,15 +1,20 @@
 //! Minecraft client JVM launch, auto-connect flags, stdout/stderr streaming, and timeout enforcement.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use deming_core::{AccountRef, DemingError, InstanceSpec, InstanceState, ProcessPriority, Result, RunEvent};
+use deming_core::{
+    AccountRef, DemingError, InstanceSpec, InstanceState, ProcessPriority, Result, RunEvent,
+    TestCompletionRule,
+};
+use regex::Regex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::scheduler::AbortHandle;
@@ -67,7 +72,7 @@ pub fn build_connect_args(mc_version: &str, host: &str, port: u16) -> Vec<String
 }
 
 /// Configuration for launching a single Minecraft client instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientLaunchConfig {
     /// Run ID for emitted [`RunEvent`]s.
     pub run_id: Uuid,
@@ -108,6 +113,34 @@ pub struct ClientLaunchConfig {
     /// from the desktop and taskbar (`DWMWA_CLOAK` + `WS_EX_TOOLWINDOW`) so live frames
     /// can be captured invisibly in the background.
     pub cloak_window: bool,
+    /// Optional callback invoked immediately with the child OS PID after spawn.
+    pub on_pid: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+}
+
+impl fmt::Debug for ClientLaunchConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientLaunchConfig")
+            .field("run_id", &self.run_id)
+            .field("java_exe", &self.java_exe)
+            .field("instance_dir", &self.instance_dir)
+            .field("spec", &self.spec)
+            .field("main_class", &self.main_class)
+            .field("classpath", &self.classpath)
+            .field("natives_dir", &self.natives_dir)
+            .field("assets_dir", &self.assets_dir)
+            .field("asset_index", &self.asset_index)
+            .field("access_token", &self.access_token.as_ref().map(|_| "<redacted>"))
+            .field("ram_mb", &self.ram_mb)
+            .field("cpu_cores", &self.cpu_cores)
+            .field("priority", &self.priority)
+            .field("connect_server", &self.connect_server)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("extra_jvm_args", &self.extra_jvm_args)
+            .field("extra_game_args", &self.extra_game_args)
+            .field("cloak_window", &self.cloak_window)
+            .field("on_pid", &self.on_pid.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 /// Filters out unexpanded Mojang `${...}` placeholder arguments and their preceding flags
@@ -314,6 +347,10 @@ pub async fn run_client(
         return Err(err);
     }
 
+    if let (Some(p), Some(cb)) = (pid, &config.on_pid) {
+        cb(p);
+    }
+
     emit_state(
         &events,
         config.run_id,
@@ -328,6 +365,21 @@ pub async fn run_client(
     let stdout_buf = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf = Arc::new(Mutex::new(Vec::new()));
     let combined_buf = Arc::new(Mutex::new(Vec::new()));
+
+    let (early_tracker, early_rx) = match rule_supports_early_completion(&config.spec.test_rule) {
+        Some((success_res, failure_res)) => {
+            let (tx, rx) = oneshot::channel::<()>();
+            (
+                Some(Arc::new(Mutex::new(EarlyMatchTracker::new(
+                    success_res,
+                    failure_res,
+                    tx,
+                )))),
+                Some(rx),
+            )
+        }
+        None => (None, None),
+    };
 
     let mut reader_tasks = Vec::new();
 
@@ -353,62 +405,42 @@ pub async fn run_client(
     };
 
     if let Some(out) = stdout {
-        let out_ref = Arc::clone(&stdout_buf);
-        let comb_ref = Arc::clone(&combined_buf);
-        let events_ref = events.clone();
-        let run_id = config.run_id;
-        let source = config.spec.id.clone();
-        reader_tasks.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(mut g) = out_ref.lock() {
-                    g.push(line.clone());
-                }
-                if let Ok(mut g) = comb_ref.lock() {
-                    g.push(line.clone());
-                }
-                if let Some(tx) = &events_ref {
-                    let _ = tx.send(RunEvent::LogLine {
-                        run_id,
-                        source: source.clone(),
-                        line,
-                        timestamp: Utc::now(),
-                    });
-                }
-            }
-        }));
+        reader_tasks.push(spawn_log_reader(
+            out,
+            Arc::clone(&stdout_buf),
+            Arc::clone(&combined_buf),
+            events.clone(),
+            config.run_id,
+            config.spec.id.clone(),
+            early_tracker.clone(),
+        ));
     }
 
     if let Some(err_stream) = stderr {
-        let err_ref = Arc::clone(&stderr_buf);
-        let comb_ref = Arc::clone(&combined_buf);
-        let events_ref = events.clone();
-        let run_id = config.run_id;
-        let source = config.spec.id.clone();
-        reader_tasks.push(tokio::spawn(async move {
-            let mut lines = BufReader::new(err_stream).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(mut g) = err_ref.lock() {
-                    g.push(line.clone());
-                }
-                if let Ok(mut g) = comb_ref.lock() {
-                    g.push(line.clone());
-                }
-                if let Some(tx) = &events_ref {
-                    let _ = tx.send(RunEvent::LogLine {
-                        run_id,
-                        source: source.clone(),
-                        line,
-                        timestamp: Utc::now(),
-                    });
-                }
-            }
-        }));
+        reader_tasks.push(spawn_log_reader(
+            err_stream,
+            Arc::clone(&stderr_buf),
+            Arc::clone(&combined_buf),
+            events.clone(),
+            config.run_id,
+            config.spec.id.clone(),
+            early_tracker.clone(),
+        ));
     }
 
     let mut timed_out = false;
     let mut aborted = false;
     let mut exit_code = None;
+
+    let early_fut = async move {
+        match early_rx {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(early_fut);
 
     if config.timeout_secs > 0 {
         let sleep = tokio::time::sleep(Duration::from_secs(config.timeout_secs));
@@ -417,6 +449,10 @@ pub async fn run_client(
         tokio::select! {
             status = child.wait() => {
                 exit_code = status?.code();
+            }
+            _ = &mut early_fut => {
+                let _ = job.terminate_all();
+                let _ = child.wait().await;
             }
             _ = abort.cancelled() => {
                 aborted = true;
@@ -433,6 +469,10 @@ pub async fn run_client(
         tokio::select! {
             status = child.wait() => {
                 exit_code = status?.code();
+            }
+            _ = &mut early_fut => {
+                let _ = job.terminate_all();
+                let _ = child.wait().await;
             }
             _ = abort.cancelled() => {
                 aborted = true;
@@ -470,13 +510,129 @@ pub async fn run_client(
     })
 }
 
-/// Writes `<instance_dir>/options.txt` with `onboardAccessibility:false\n` if missing,
-/// so fresh test instances skip Minecraft's Accessibility Onboarding screen and allow
-/// `--quickPlayMultiplayer` to auto-connect immediately.
+/// Returns `Some((success_regexes, failure_regexes))` if `rule` depends purely on log patterns
+/// (i.e. a [`TestCompletionRule::LogPattern`] or a [`TestCompletionRule::Composite`] without
+/// `ExitCodeZero` or `GameTestReport`), allowing `run_client` to terminate the client cleanly
+/// as soon as the rule passes or fails without waiting for `timeout_secs`.
+pub fn rule_supports_early_completion(
+    rule: &TestCompletionRule,
+) -> Option<(Vec<Regex>, Vec<Regex>)> {
+    match rule {
+        TestCompletionRule::LogPattern {
+            success_regex,
+            failure_regex,
+        } => {
+            let succ = Regex::new(success_regex).ok()?;
+            let mut fails = Vec::new();
+            if let Some(pat) = failure_regex {
+                fails.push(Regex::new(pat).ok()?);
+            }
+            Some((vec![succ], fails))
+        }
+        TestCompletionRule::Composite(sub_rules) => {
+            if sub_rules.is_empty() {
+                return None;
+            }
+            let mut all_succ = Vec::new();
+            let mut all_fail = Vec::new();
+            for sub in sub_rules {
+                let (s, f) = rule_supports_early_completion(sub)?;
+                all_succ.extend(s);
+                all_fail.extend(f);
+            }
+            Some((all_succ, all_fail))
+        }
+        TestCompletionRule::ExitCodeZero | TestCompletionRule::GameTestReport { .. } => None,
+    }
+}
+
+struct EarlyMatchTracker {
+    success_res: Vec<Regex>,
+    failure_res: Vec<Regex>,
+    matched_success: Vec<bool>,
+    tx: Option<oneshot::Sender<()>>,
+}
+
+impl EarlyMatchTracker {
+    fn new(success_res: Vec<Regex>, failure_res: Vec<Regex>, tx: oneshot::Sender<()>) -> Self {
+        let len = success_res.len();
+        Self {
+            success_res,
+            failure_res,
+            matched_success: vec![false; len],
+            tx: Some(tx),
+        }
+    }
+
+    fn check_line(&mut self, line: &str) {
+        if self.tx.is_none() {
+            return;
+        }
+        if self.failure_res.iter().any(|re| re.is_match(line)) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+            return;
+        }
+        for (idx, re) in self.success_res.iter().enumerate() {
+            if !self.matched_success[idx] && re.is_match(line) {
+                self.matched_success[idx] = true;
+            }
+        }
+        if !self.matched_success.is_empty() && self.matched_success.iter().all(|&m| m) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+fn spawn_log_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    stream: R,
+    stream_buf: Arc<Mutex<Vec<String>>>,
+    combined_buf: Arc<Mutex<Vec<String>>>,
+    events: Option<mpsc::UnboundedSender<RunEvent>>,
+    run_id: Uuid,
+    source: String,
+    early_tracker: Option<Arc<Mutex<EarlyMatchTracker>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(mut g) = stream_buf.lock() {
+                g.push(line.clone());
+            }
+            if let Ok(mut g) = combined_buf.lock() {
+                g.push(line.clone());
+            }
+            if let Some(tx) = &events {
+                let _ = tx.send(RunEvent::LogLine {
+                    run_id,
+                    source: source.clone(),
+                    line: line.clone(),
+                    timestamp: Utc::now(),
+                });
+            }
+            if let Some(tracker) = &early_tracker {
+                if let Ok(mut t) = tracker.lock() {
+                    t.check_line(&line);
+                }
+            }
+        }
+    })
+}
+
+/// Writes `<instance_dir>/options.txt` with `onboardAccessibility:false`,
+/// `pauseOnLostFocus:false`, and `rawMouseInput:false` if missing, so fresh test
+/// instances skip Minecraft's Accessibility Onboarding screen and do not pause or grab
+/// the cursor when cloaked or unfocused.
 pub fn ensure_default_options_txt(instance_dir: &Path) -> Result<()> {
     let options_path = instance_dir.join("options.txt");
     if !options_path.exists() {
-        std::fs::write(&options_path, "onboardAccessibility:false\n")?;
+        std::fs::write(
+            &options_path,
+            "onboardAccessibility:false\npauseOnLostFocus:false\nrawMouseInput:false\n",
+        )?;
     }
     Ok(())
 }
@@ -540,6 +696,7 @@ mod tests {
             extra_jvm_args: vec![],
             extra_game_args: vec![],
             cloak_window: false,
+            on_pid: None,
         };
 
         let args = cfg.build_args();
@@ -652,6 +809,7 @@ mod tests {
                 "--demo".to_string(),
             ],
             cloak_window: false,
+            on_pid: None,
         };
 
         let args = cfg.build_args();
@@ -703,7 +861,7 @@ mod tests {
         let options_path = dir.join("options.txt");
         assert_eq!(
             std::fs::read_to_string(&options_path).unwrap(),
-            "onboardAccessibility:false\n"
+            "onboardAccessibility:false\npauseOnLostFocus:false\nrawMouseInput:false\n"
         );
 
         // Existing options.txt must be preserved untouched.
@@ -715,5 +873,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rule_supports_early_completion_recognizes_log_rules_only() {
+        // Pure LogPattern is eligible for early completion.
+        let log_rule = TestCompletionRule::LogPattern {
+            success_regex: "joined the game".to_string(),
+            failure_regex: Some("FATAL|Exception".to_string()),
+        };
+        let (succ, fail) = rule_supports_early_completion(&log_rule).expect("LogPattern eligible");
+        assert_eq!(succ.len(), 1);
+        assert_eq!(fail.len(), 1);
+
+        // Composite of LogPatterns is eligible and collects all sub-regexes.
+        let comp_log = TestCompletionRule::Composite(vec![
+            log_rule.clone(),
+            TestCompletionRule::LogPattern {
+                success_regex: "Sound engine started".to_string(),
+                failure_regex: None,
+            },
+        ]);
+        let (succ, fail) = rule_supports_early_completion(&comp_log).expect("Composite log eligible");
+        assert_eq!(succ.len(), 2);
+        assert_eq!(fail.len(), 1);
+
+        // ExitCodeZero, GameTestReport, and Composite containing them are NOT eligible.
+        assert!(rule_supports_early_completion(&TestCompletionRule::ExitCodeZero).is_none());
+        assert!(rule_supports_early_completion(&TestCompletionRule::GameTestReport {
+            report_path_glob: "*.xml".to_string()
+        })
+        .is_none());
+        assert!(rule_supports_early_completion(&TestCompletionRule::Composite(vec![
+            log_rule,
+            TestCompletionRule::ExitCodeZero,
+        ]))
+        .is_none());
+        assert!(rule_supports_early_completion(&TestCompletionRule::Composite(vec![])).is_none());
     }
 }

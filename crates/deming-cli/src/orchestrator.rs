@@ -635,6 +635,9 @@ async fn run_single_instance(
         Err(e) => return fail_result(&event_tx, run_id, &inst.id, format!("Auth error: {e}")),
     };
 
+    let pid_tx = event_tx.clone();
+    let pid_inst_id = inst.id.clone();
+
     let launch_cfg = ClientLaunchConfig {
         run_id,
         java_exe: java.executable,
@@ -661,6 +664,15 @@ async fn run_single_instance(
         extra_jvm_args: strip_unexpanded_mojang_args(&profile.jvm_args),
         extra_game_args: strip_unexpanded_mojang_args(&profile.game_args),
         cloak_window,
+        on_pid: Some(Arc::new(move |pid| {
+            let _ = pid_tx.send(RunEvent::InstanceStateChanged {
+                run_id,
+                instance_id: pid_inst_id.clone(),
+                state: InstanceState::Running,
+                message: Some(format!("pid={pid}")),
+                timestamp: Utc::now(),
+            });
+        })),
     };
 
     let outcome = match run_client(launch_cfg, &abort, Some(event_tx.clone())).await {

@@ -7,9 +7,10 @@ use chrono::{DateTime, Utc};
 use deming_archive::{LogMatch, RetentionReport, RunInfo, ScreenshotInfo};
 use deming_auth::{DeviceCodePrompt, StoredAccount};
 use deming_core::{
-    DemingConfig, GlobalResourceLimits, InstanceState, ProcessPriority, RetentionPolicy, RunEvent,
-    RunManifest, RunStatus, TestJobSpec,
+    DemingConfig, DemingLockfile, GlobalResourceLimits, InstanceState, ModsManifest,
+    ProcessPriority, RetentionPolicy, RunEvent, RunManifest, RunStatus, TestJobSpec,
 };
+use deming_fetch::SyncPlan;
 
 use crate::preset::BuilderState;
 use crate::runner_bridge::{parse_pid_from_message, DEFAULT_MSA_CLIENT_ID};
@@ -485,6 +486,8 @@ pub struct SettingsDraft {
     pub max_runs: usize,
     pub compress_after_runs: usize,
     pub auto_prune: bool,
+    pub curseforge_api_key: String,
+    pub show_cf_api_key: bool,
 }
 
 impl SettingsDraft {
@@ -499,6 +502,8 @@ impl SettingsDraft {
             max_runs: cfg.retention.max_runs,
             compress_after_runs: cfg.retention.compress_after_runs,
             auto_prune: cfg.retention.auto_prune,
+            curseforge_api_key: cfg.curseforge_api_key.clone().unwrap_or_default(),
+            show_cf_api_key: false,
         }
     }
 
@@ -522,6 +527,8 @@ impl SettingsDraft {
             return Err("default_cpu_cores_per_instance must be at least 1".to_string());
         }
 
+        let cf_key = self.curseforge_api_key.trim();
+
         Ok(DemingConfig {
             workspace_dir: PathBuf::from(ws),
             global_limits: GlobalResourceLimits {
@@ -536,8 +543,25 @@ impl SettingsDraft {
                 compress_after_runs: self.compress_after_runs,
                 auto_prune: self.auto_prune,
             },
+            curseforge_api_key: if cf_key.is_empty() {
+                None
+            } else {
+                Some(cf_key.to_string())
+            },
         })
     }
+}
+
+/// Diagnostics and mod sync/lockfile summary state shared across Builder and Dashboard.
+#[derive(Debug, Clone, Default)]
+pub struct ModSyncDiagnosticsState {
+    pub in_flight: bool,
+    pub target_instance_id: String,
+    pub last_sync_plan: Option<SyncPlan>,
+    pub last_lockfile: Option<DemingLockfile>,
+    pub last_manifest: Option<ModsManifest>,
+    pub last_pack_summary: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// Notification toast shown in the top/bottom status bar.
@@ -561,6 +585,7 @@ pub struct UiState {
     pub history: HistoryState,
     pub accounts: AccountsState,
     pub settings: SettingsDraft,
+    pub diagnostics: ModSyncDiagnosticsState,
 }
 
 #[cfg(test)]
@@ -613,6 +638,18 @@ mod tests {
         assert_eq!(card.instances[0].pid, Some(4242));
 
         card.apply_event(
+            &RunEvent::InstanceStateChanged {
+                run_id,
+                instance_id: "c1".to_string(),
+                state: InstanceState::Running,
+                message: Some("pid=98765".to_string()),
+                timestamp: Utc::now(),
+            },
+            &cfg.global_limits,
+        );
+        assert_eq!(card.instances[0].pid, Some(98765));
+
+        card.apply_event(
             &RunEvent::LogLine {
                 run_id,
                 source: "c1".to_string(),
@@ -661,6 +698,13 @@ mod tests {
         draft.max_total_ram_mb = 512;
         draft.default_instance_ram_mb = 1024;
         assert!(draft.to_config().is_err());
+
+        let mut cf_draft = SettingsDraft::from_config(&cfg);
+        cf_draft.curseforge_api_key = "  cf-secret-key  ".to_string();
+        let cf_cfg = cf_draft.to_config().expect("valid settings with cf key");
+        assert_eq!(cf_cfg.curseforge_api_key.as_deref(), Some("cf-secret-key"));
+        cf_draft.curseforge_api_key = "   ".to_string();
+        assert_eq!(cf_draft.to_config().unwrap().curseforge_api_key, None);
     }
 
     #[test]

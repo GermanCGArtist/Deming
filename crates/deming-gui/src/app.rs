@@ -1,15 +1,17 @@
 //! Root `eframe::App` implementation for Deming GUI.
 
+use std::path::PathBuf;
+
 use chrono::Utc;
 use deming_auth::AccountStore;
 use deming_core::{DemingConfig, RunStatus};
 use egui::{Color32, RichText};
 
-use crate::preset::BuilderState;
+use crate::preset::{BuilderState, InstanceDraft, ModEntryDraft};
 use crate::runner_bridge::{default_config_path, BridgeMessage, GuiBridge};
 use crate::state::{
-    AccountsState, ActiveTab, DashboardState, HistoryState, LiveRunCard, SettingsDraft,
-    StatusToast, UiState,
+    AccountsState, ActiveTab, DashboardState, HistoryState, LiveRunCard,
+    ModSyncDiagnosticsState, SettingsDraft, StatusToast, UiState,
 };
 use crate::theme::{
     apply_obsidian_theme, ACCENT_EMERALD, BG_BASE, BG_SURFACE, BORDER_SUBTLE, DANGER_RED,
@@ -25,8 +27,8 @@ pub struct DemingApp {
 }
 
 impl DemingApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let config_path = default_config_path();
+    pub fn new(cc: &eframe::CreationContext<'_>, config_path_override: Option<PathBuf>) -> Self {
+        let config_path = config_path_override.unwrap_or_else(default_config_path);
         let config = DemingConfig::load_or_default(&config_path).unwrap_or_default();
         let accounts = AccountStore::from_config(&config).load().unwrap_or_default();
 
@@ -39,6 +41,13 @@ impl DemingApp {
         let bridge = GuiBridge::new();
         bridge.start_ipc_server(config.workspace_dir.clone());
 
+        let builder = BuilderState::default();
+        let initial_target_id = builder
+            .instances
+            .first()
+            .map(|i| i.id.clone())
+            .unwrap_or_else(|| "client-1".to_string());
+
         let mut state = UiState {
             active_tab: ActiveTab::Dashboard,
             config_path,
@@ -48,10 +57,14 @@ impl DemingApp {
             ipc_error: None,
             toast: None,
             dashboard: DashboardState::default(),
-            builder: BuilderState::default(),
+            builder,
             history: HistoryState::default(),
             accounts: AccountsState {
                 accounts,
+                ..Default::default()
+            },
+            diagnostics: ModSyncDiagnosticsState {
+                target_instance_id: initial_target_id,
                 ..Default::default()
             },
         };
@@ -298,6 +311,110 @@ impl DemingApp {
                         Err(err) => {
                             self.state.accounts.popup_is_error = true;
                             self.state.accounts.popup_status_msg = Some(err);
+                        }
+                    }
+                }
+                BridgeMessage::ModpackImported(res) => {
+                    self.state.diagnostics.in_flight = false;
+                    match res {
+                        Ok(payload) => {
+                            if self.state.builder.instances.is_empty() {
+                                self.state
+                                    .builder
+                                    .instances
+                                    .push(InstanceDraft::new_with_index(1));
+                            }
+                            if let Some(inst) = self.state.builder.instances.first_mut() {
+                                inst.mc_version = payload.manifest.mc_version.clone();
+                                inst.loader = payload.manifest.loader;
+                                inst.loader_version =
+                                    payload.manifest.loader_version.clone().unwrap_or_default();
+                                inst.mods = payload
+                                    .manifest
+                                    .mods
+                                    .iter()
+                                    .map(ModEntryDraft::from_mod_source)
+                                    .collect();
+                            }
+                            if self.state.builder.job_name.trim().is_empty()
+                                || self.state.builder.job_name == "mod-smoke-test"
+                            {
+                                self.state.builder.job_name = payload.pack_name.clone();
+                            }
+                            self.state.diagnostics.last_manifest = Some(payload.manifest);
+                            self.state.diagnostics.last_lockfile = payload.lockfile;
+                            self.state.diagnostics.last_pack_summary =
+                                Some(payload.summary.clone());
+                            self.state.diagnostics.last_error = if payload.warnings.is_empty() {
+                                None
+                            } else {
+                                Some(payload.warnings.join("\n"))
+                            };
+                            self.state.toast = Some(StatusToast {
+                                is_error: !payload.warnings.is_empty(),
+                                text: payload.summary,
+                                created_at: Utc::now(),
+                            });
+                        }
+                        Err(err) => {
+                            self.state.diagnostics.last_error = Some(err.clone());
+                            self.state.toast = Some(StatusToast {
+                                is_error: true,
+                                text: format!("Modpack import failed: {err}"),
+                                created_at: Utc::now(),
+                            });
+                        }
+                    }
+                }
+                BridgeMessage::ModpackExported(res) => {
+                    self.state.diagnostics.in_flight = false;
+                    match res {
+                        Ok(path) => {
+                            self.state.diagnostics.last_error = None;
+                            self.state.toast = Some(StatusToast {
+                                is_error: false,
+                                text: format!("Exported .mrpack to {}", path.display()),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        Err(err) => {
+                            self.state.diagnostics.last_error = Some(err.clone());
+                            self.state.toast = Some(StatusToast {
+                                is_error: true,
+                                text: format!("Modpack export failed: {err}"),
+                                created_at: Utc::now(),
+                            });
+                        }
+                    }
+                }
+                BridgeMessage::ModsSynced { dry_run, result } => {
+                    self.state.diagnostics.in_flight = false;
+                    match result {
+                        Ok(plan) => {
+                            self.state.diagnostics.last_error = None;
+                            self.state.diagnostics.last_lockfile = Some(plan.lockfile.clone());
+                            let summary = format!(
+                                "{} sync: +{} added, ~{} updated, -{} removed, ={} unchanged",
+                                if dry_run { "Dry-run" } else { "Applied" },
+                                plan.added.len(),
+                                plan.updated.len(),
+                                plan.removed.len(),
+                                plan.unchanged.len()
+                            );
+                            self.state.diagnostics.last_sync_plan = Some(plan);
+                            self.state.toast = Some(StatusToast {
+                                is_error: false,
+                                text: summary,
+                                created_at: Utc::now(),
+                            });
+                        }
+                        Err(err) => {
+                            self.state.diagnostics.last_error = Some(err.clone());
+                            self.state.toast = Some(StatusToast {
+                                is_error: true,
+                                text: format!("Mod sync failed: {err}"),
+                                created_at: Utc::now(),
+                            });
                         }
                     }
                 }

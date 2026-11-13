@@ -82,6 +82,9 @@ pub struct DemingConfig {
     pub global_limits: GlobalResourceLimits,
     /// Retention policy for historical run artifacts.
     pub retention: RetentionPolicy,
+    /// Optional CurseForge API key for resolving CurseForge-hosted mods/modpacks.
+    #[serde(default)]
+    pub curseforge_api_key: Option<String>,
 }
 
 impl Default for DemingConfig {
@@ -91,6 +94,7 @@ impl Default for DemingConfig {
             workspace_dir: base.join("deming"),
             global_limits: GlobalResourceLimits::default(),
             retention: RetentionPolicy::default(),
+            curseforge_api_key: None,
         }
     }
 }
@@ -187,6 +191,7 @@ mod tests {
                 compress_after_runs: 20,
                 auto_prune: false,
             },
+            curseforge_api_key: Some("cf-test-key".to_string()),
         };
 
         custom.save(&config_path).unwrap();

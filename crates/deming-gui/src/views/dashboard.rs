@@ -181,6 +181,14 @@ pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
         ui.add_space(8.0);
         render_live_log_drawer(ui, state, &run_id, &source);
     }
+
+    if state.diagnostics.last_error.is_some()
+        || state.diagnostics.last_sync_plan.is_some()
+        || state.diagnostics.last_lockfile.is_some()
+    {
+        ui.add_space(8.0);
+        crate::views::builder::render_diagnostics_and_sync_drawer(ui, state, bridge);
+    }
 }
 
 fn render_run_card(

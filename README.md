@@ -2,6 +2,10 @@
 
 # Deming
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue.svg)]()
+[![Rust: 2021](https://img.shields.io/badge/Rust-2021%20Edition-orange.svg)]()
+
 > **High-Throughput Parallel Minecraft Java Edition Mod Testing & Orchestration Engine**  
 > *Pure Rust desktop app, JSON CLI, and Model Context Protocol (MCP) server for automated, deterministic mod testing across Vanilla, Fabric, NeoForge, Forge, and Quilt.*
 
@@ -11,14 +15,20 @@
 
 **Deming** is a high-performance orchestration and test-automation platform tailored specifically for Minecraft Java Edition mod developers, modpack authors, CI/CD pipelines, and AI coding agents.
 
-Named in honor of W. Edwards Deming and the continuous improvement philosophy (PDCA), Deming transforms manual mod debugging and compatibility matrices into deterministic, repeatable, and automated execution jobs. Deming lets you launch, coordinate, evaluate, and snapshot multiple Minecraft client and server instances concurrently on a single machine—all backed by strict OS-level resource isolation and failure safety.
+Named in honor of W. Edwards Deming and the continuous improvement philosophy (PDCA), Deming transforms manual mod debugging, dependency updates, and compatibility matrices into deterministic, repeatable, and automated execution jobs. Deming lets you launch, coordinate, evaluate, and snapshot multiple Minecraft client and server instances concurrently on a single machine—all backed by strict OS-level resource isolation and failure safety.
 
 ---
 
 ## Key Features
 
 - 🤖 **AI-First JSON CLI & Model Context Protocol (MCP) Server**  
-  Built from the ground up for agentic workflows. Exposes standard stdio JSON-RPC MCP endpoints (`get_config`, `set_config`, `add_offline_account`, `submit_test_run`, `get_run_status`, `list_runs`, `tail_instance_logs`, `capture_screenshot`, `abort_run`) and clean JSON CLI subcommands, enabling LLM agents to autonomously verify mod builds, inspect crashes, and capture visual proof.
+  Built from the ground up for agentic workflows. Exposes standard stdio JSON-RPC MCP endpoints (including crash log analysis, batch mod updates, run lifecycle control, and screenshot inspection) and clean JSON CLI subcommands, enabling LLM agents to autonomously verify mod builds, inspect crashes, and capture visual proof.
+
+- 📦 **Manifest-Driven Package Management (`deming.toml` & `deming.lock`)**  
+  Declaratively define mod dependencies with `deming.toml` and pin exact mod versions, download URLs, and SHA-256 hashes via `deming.lock`. Perform Modrinth searches (`deming search`), add dependencies (`deming add`), and run syncs with dry-run verification (`deming sync --dry-run`).
+
+- 🎒 **Modpack Ingestion (.mrpack & CurseForge)**  
+  Direct support for importing Modrinth modpack archives (`.mrpack`) and CurseForge modpacks, extracting manifests, resolving required client/server dependencies, and running test matrices automatically.
 
 - ⚡ **Multi-Loader Matrix Testing**  
   First-class support across the entire modern Minecraft Java ecosystem:
@@ -38,10 +48,13 @@ Named in honor of W. Edwards Deming and the continuous improvement philosophy (P
 - 🔑 **Multi-Account Management**  
   Manage offline development accounts (with deterministic UUID v3 generation) for fast local iteration, side-by-side with Microsoft Authentication (MSA) via OAuth 2.0 Device-Code flow (Xbox Live, XSTS, and Minecraft session tokens) for online compatibility testing.
 
-- 📸 **Native Window Screenshot Capture**  
-  Captures native OS window buffers (`PrintWindow` / `BitBlt`) directly via HWND discovery and PID matching to generate visual artifacts of main menus, in-game states, or crash HUDs without requiring in-game mods.
+- 📸 **Native Window Screenshot Capture & Window Cloaking**  
+  Captures native OS window buffers (`PrintWindow` / `BitBlt`) directly via HWND discovery and PID matching to generate visual artifacts of main menus, in-game states, or crash HUDs without requiring in-game mods. Optional `--cloak` mode runs instances without cluttering your desktop or taskbar while preserving full capture capabilities.
 
-- 📦 **Structured Run Archiving & Retention**  
+- 📊 **Crash Log Analysis & Diagnostic Tools**  
+  Specialized diagnostic parsing analyzes crash reports, stack traces, and mod conflicts to pinpoint culprits and recommend remediation steps.
+
+- 🗃️ **Structured Run Archiving & Retention**  
   Every test run is isolated into a structured directory with `manifest.json`, stdout/stderr logs, screenshots, JUnit/GameTest XML reports, and rule evaluation outcomes. Automatic retention policies handle pruning and `.zip` archiving.
 
 - 🖥️ **Obsidian-Themed Native GUI**  
@@ -55,7 +68,7 @@ Deming is engineered as a clean, modular Rust workspace:
 
 ```
 crates/
-├── deming-core      # Domain models, configuration schemas, job specs, and event definitions
+├── deming-core      # Domain models, config schemas, lockfiles, mod manifests, job specs & events
 ├── deming-fetch     # Mojang metadata, loader resolvers, Adoptium Java JRE manager, Modrinth client
 ├── deming-auth      # Microsoft Device-Code OAuth, Xbox Live/XSTS, offline UUID accounts & keystore
 ├── deming-runner    # Windows Job Objects, process scheduler, server/client runners, HWND capture
@@ -84,26 +97,63 @@ cargo build --workspace --release
 ```
 
 Compiled binaries will be available in `target/release/`:
-- `deming-cli.exe`
-- `deming-gui.exe`
+- `deming.exe` (or `deming-cli.exe` / `deming-gui.exe`)
 
 ---
 
 ## Usage
 
+### Unified Binary Entrypoint
+
+The main binary `deming` serves as an intelligent entrypoint:
+- Running `deming` without arguments launches the **GUI** desktop interface.
+- Running `deming <subcommand>` (e.g. `deming run`, `deming mcp`, `deming search`) executes the **CLI / MCP** commands.
+
+---
+
 ### 1. Launching the GUI
 
-Start the graphical desktop environment:
+Start the graphical desktop application:
 
 ```bash
-cargo run --bin deming-gui --release
+deming
+# or directly:
+cargo run -p deming-gui --release
 ```
 
 The GUI connects to the local Deming IPC bus to monitor runs submitted via the CLI or MCP in real time, configure accounts, and build test suites interactively.
 
-### 2. Using the CLI
+---
 
-Deming provides a structured, scriptable CLI:
+### 2. Mod & Dependency Management
+
+Deming provides declarative mod management powered by `deming.toml` and deterministic `deming.lock` files.
+
+#### Search for Mods
+Search Modrinth for mods matching your target loader and Minecraft version:
+```bash
+deming search "sodium" --mc-version 1.20.4 --loader fabric
+```
+
+#### Add Mods to `deming.toml`
+Add a mod by slug or project ID:
+```bash
+deming add sodium
+```
+
+#### Sync & Lockfile Verification
+Synchronize local mod files according to `deming.toml` and update `deming.lock`:
+```bash
+# Preview changes without modifying files or downloading
+deming sync --dry-run
+
+# Synchronize mods
+deming sync
+```
+
+---
+
+### 3. Using the CLI for Test Runs
 
 #### Manage Configuration
 ```bash
@@ -130,7 +180,10 @@ deming account login-msa
 Submit a test specification file (`job.json`):
 
 ```bash
-deming run submit --spec job.json
+deming run submit job.json
+
+# Run in cloaked mode (no visible windows, captures still functional)
+deming run submit job.json --cloak
 ```
 
 Example `job.json`:
@@ -171,7 +224,9 @@ deming run status <RUN_ID>
 deming run logs <RUN_ID> client-1 --tail 100
 ```
 
-### 3. Model Context Protocol (MCP) Server
+---
+
+### 4. Model Context Protocol (MCP) Server
 
 Deming includes a built-in MCP server for integration with Claude Desktop, Cursor, Gemini, or any MCP-compatible AI agent harness:
 
@@ -184,7 +239,7 @@ deming mcp
 {
   "mcpServers": {
     "deming": {
-      "command": "F:\\workflow\\Deming\\target\\release\\deming-cli.exe",
+      "command": "F:\\workflow\\Deming\\target\\release\\deming.exe",
       "args": ["mcp"]
     }
   }
@@ -202,9 +257,11 @@ deming mcp
 - `tail_instance_logs`: Fetch stdout/stderr logs from running or completed instances.
 - `capture_screenshot`: Take an immediate native window capture of an active client instance.
 - `abort_run`: Instantly terminate a test run and clean up all child processes.
+- `analyze_crash_log`: Parse and diagnose crash reports, stack traces, and mod conflict root causes.
+- `batch_update_mods`: Check and apply updates across mod dependencies against target MC/loader versions.
 
 ---
 
 ## License
 
-This project is licensed under the Apache License 2.0 or MIT License at your option.
+This project is licensed under the [MIT License](LICENSE).

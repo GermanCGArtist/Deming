@@ -204,6 +204,7 @@ mod tests {
             workspace_dir: dir,
             global_limits: GlobalResourceLimits::default(),
             retention: RetentionPolicy::default(),
+            curseforge_api_key: None,
         }
     }
 

@@ -1,11 +1,16 @@
 //! Mod resolution for `ModSource::LocalPath` and `ModSource::Modrinth`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use deming_core::{DemingError, ModLoader, ModSource, Result};
+use deming_core::{DemingError, LockedMod, ModLoader, ModSource, Result};
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::util::{build_http_client, compute_sha256, download_file, fetch_json};
+use crate::util::{
+    build_http_client, compute_sha256, download_file, fetch_json, link_or_copy, store_blob_sha256,
+};
 use crate::{report_progress, ProgressCallback};
 
 /// Official Modrinth API v2 base URL.
@@ -51,6 +56,37 @@ pub struct ResolvedMod {
     pub filename: String,
     pub destination_path: PathBuf,
     pub sha256: String,
+}
+
+/// Unified mod search hit returned by [`ModrinthClient::search_projects`] and [`crate::CurseForgeClient::search_mods`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModSearchHit {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub source: String,
+    pub downloads: u64,
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthSearchResponse {
+    #[serde(default)]
+    hits: Vec<ModrinthSearchHitRaw>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthSearchHitRaw {
+    project_id: String,
+    slug: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    downloads: u64,
+    #[serde(default)]
+    categories: Vec<String>,
 }
 
 /// Client for querying Modrinth API v2.
@@ -99,6 +135,60 @@ impl ModrinthClient {
         fetch_json(&self.http, &url).await
     }
 
+    /// Searches Modrinth projects matching `query` and optional `mc_version` / `loader` facets.
+    pub async fn search_projects(
+        &self,
+        query: &str,
+        mc_version: Option<&str>,
+        loader: Option<ModLoader>,
+        limit: usize,
+    ) -> Result<Vec<ModSearchHit>> {
+        let mut facets: Vec<Vec<String>> = vec![vec!["project_type:mod".to_string()]];
+        if let Some(ver) = mc_version {
+            facets.push(vec![format!("versions:{ver}")]);
+        }
+        if let Some(ldr) = loader.and_then(modrinth_loader_slug) {
+            facets.push(vec![format!("categories:{ldr}")]);
+        }
+        let facets_json = serde_json::to_string(&facets)?;
+        let resp = self
+            .http
+            .get(format!("{}/search", self.base_url))
+            .query(&[
+                ("query", query),
+                ("limit", &limit.max(1).to_string()),
+                ("facets", &facets_json),
+            ])
+            .send()
+            .await
+            .map_err(|e| DemingError::Network(format!("Modrinth search failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(DemingError::Network(format!(
+                "Modrinth search returned HTTP {status}"
+            )));
+        }
+        let body: ModrinthSearchResponse = resp
+            .json()
+            .await
+            .map_err(|e| DemingError::Network(format!("failed to decode Modrinth search: {e}")))?;
+
+        Ok(body
+            .hits
+            .into_iter()
+            .map(|h| ModSearchHit {
+                id: h.project_id,
+                slug: h.slug,
+                title: h.title,
+                description: h.description,
+                source: "modrinth".to_string(),
+                downloads: h.downloads,
+                categories: h.categories,
+            })
+            .collect())
+    }
+
     /// Returns a reference to the underlying `reqwest::Client`.
     pub fn http(&self) -> &reqwest::Client {
         &self.http
@@ -144,7 +234,8 @@ pub async fn resolve_mods(
 }
 
 /// Resolves all [`ModSource`] entries into `instance_mods_dir`, caching Modrinth downloads
-/// by SHA-256 under `cache_dir/mods/` and emitting progress updates.
+/// by SHA-256 under `cache_dir/blobs/sha256/` (hardlinked into `instance_mods_dir`)
+/// and emitting progress updates.
 pub async fn resolve_mods_with_progress(
     client: &ModrinthClient,
     mods: &[ModSource],
@@ -156,50 +247,65 @@ pub async fn resolve_mods_with_progress(
 ) -> Result<Vec<ResolvedMod>> {
     tokio::fs::create_dir_all(instance_mods_dir).await?;
     let total = mods.len() as u64;
-    let mut resolved = Vec::new();
-
-    for (idx, source) in mods.iter().enumerate() {
-        match source {
-            ModSource::LocalPath(path) => {
-                report_progress(
-                    progress.as_ref(),
-                    idx as u64,
-                    total.max(1),
-                    &format!("Copying local mod(s) from {}", path.display()),
-                );
-                resolved.extend(resolve_local_mod_path(path, instance_mods_dir).await?);
-            }
-            ModSource::Modrinth {
-                project_id_or_slug,
-                version_id,
-            } => {
-                report_progress(
-                    progress.as_ref(),
-                    idx as u64,
-                    total.max(1),
-                    &format!("Resolving Modrinth mod {project_id_or_slug}"),
-                );
-                let item = resolve_modrinth_mod(
-                    client,
-                    project_id_or_slug,
-                    version_id.as_deref(),
-                    mc_version,
-                    loader,
-                    cache_dir,
-                    instance_mods_dir,
-                )
-                .await?;
-                resolved.push(item);
-            }
-        }
-        report_progress(
-            progress.as_ref(),
-            (idx + 1) as u64,
-            total.max(1),
-            &format!("Resolved mod {}/{total}", idx + 1),
-        );
+    if total == 0 {
+        return Ok(Vec::new());
     }
+    report_progress(
+        progress.as_ref(),
+        0,
+        total,
+        &format!("Resolving {total} mod(s)"),
+    );
 
+    let completed = Arc::new(AtomicU64::new(0));
+    let items: Vec<Result<Vec<ResolvedMod>>> = stream::iter(mods.iter().cloned())
+        .map(|source| {
+            let client = client.clone();
+            let mc_version = mc_version.to_string();
+            let cache_dir = cache_dir.to_path_buf();
+            let instance_mods_dir = instance_mods_dir.to_path_buf();
+            let completed = Arc::clone(&completed);
+            let progress = progress.clone();
+            async move {
+                let batch = match source {
+                    ModSource::LocalPath(path) => {
+                        resolve_local_mod_path(&path, &instance_mods_dir).await?
+                    }
+                    ModSource::Modrinth {
+                        project_id_or_slug,
+                        version_id,
+                    } => {
+                        let item = resolve_modrinth_mod(
+                            &client,
+                            &project_id_or_slug,
+                            version_id.as_deref(),
+                            &mc_version,
+                            loader,
+                            &cache_dir,
+                            &instance_mods_dir,
+                        )
+                        .await?;
+                        vec![item]
+                    }
+                };
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                report_progress(
+                    progress.as_ref(),
+                    done,
+                    total,
+                    &format!("Resolved mod {done}/{total}"),
+                );
+                Ok(batch)
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+
+    let mut resolved = Vec::new();
+    for res in items {
+        resolved.extend(res?);
+    }
     Ok(resolved)
 }
 
@@ -250,15 +356,14 @@ async fn copy_jar_to_mods_dir(src: &Path, instance_mods_dir: &Path) -> Result<Re
     })
 }
 
-async fn resolve_modrinth_mod(
+/// Resolves Modrinth version and primary file metadata without downloading the JAR.
+pub(crate) async fn resolve_modrinth_metadata(
     client: &ModrinthClient,
     project_id_or_slug: &str,
     version_id: Option<&str>,
     mc_version: &str,
     loader: ModLoader,
-    cache_dir: &Path,
-    instance_mods_dir: &Path,
-) -> Result<ResolvedMod> {
+) -> Result<(ModrinthVersion, ModrinthFile)> {
     let version = match version_id {
         Some(vid) => client.get_version(vid).await?,
         None => {
@@ -284,6 +389,7 @@ async fn resolve_modrinth_mod(
         .find(|f| f.primary)
         .or_else(|| version.files.iter().find(|f| f.filename.ends_with(".jar")))
         .or_else(|| version.files.first())
+        .cloned()
         .ok_or_else(|| {
             DemingError::Network(format!(
                 "Modrinth version '{}' has no downloadable files",
@@ -291,12 +397,26 @@ async fn resolve_modrinth_mod(
             ))
         })?;
 
-    // Download to a temporary staging path if SHA-256 isn't known upfront, then move into
-    // `<cache_dir>/mods/<sha256>/<filename>`.
+    Ok((version, file))
+}
+
+/// Downloads a Modrinth mod into `<cache_dir>/blobs/sha256/<sha256>.jar` and returns `(LockedMod, blob_path)`.
+pub(crate) async fn resolve_modrinth_to_blob(
+    client: &ModrinthClient,
+    project_id_or_slug: &str,
+    version_id: Option<&str>,
+    mc_version: &str,
+    loader: ModLoader,
+    cache_dir: &Path,
+) -> Result<(LockedMod, PathBuf)> {
+    let (version, file) =
+        resolve_modrinth_metadata(client, project_id_or_slug, version_id, mc_version, loader)
+            .await?;
+
     let tmp_dest = cache_dir
-        .join("mods")
+        .join("blobs")
         .join("tmp")
-        .join(&file.filename);
+        .join(format!("{}-{}", version.id, &file.filename));
     let (_sha1, sha256) = download_file(
         client.http(),
         &file.url,
@@ -307,23 +427,46 @@ async fn resolve_modrinth_mod(
     )
     .await?;
 
-    let cached_path = mod_cache_path(cache_dir, &sha256, &file.filename);
-    if !cached_path.is_file() {
-        if let Some(parent) = cached_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::rename(&tmp_dest, &cached_path).await?;
-    } else {
-        let _ = tokio::fs::remove_file(&tmp_dest).await;
-    }
+    let blob_path = store_blob_sha256(cache_dir, &tmp_dest, &sha256).await?;
+    let locked = LockedMod {
+        id: project_id_or_slug.to_string(),
+        name: project_id_or_slug.to_string(),
+        source: "modrinth".to_string(),
+        version_id: version.id,
+        filename: file.filename,
+        url: file.url,
+        sha256,
+        sha512: file.hashes.sha512,
+    };
+    Ok((locked, blob_path))
+}
 
-    let dest = instance_mods_dir.join(&file.filename);
-    tokio::fs::copy(&cached_path, &dest).await?;
+async fn resolve_modrinth_mod(
+    client: &ModrinthClient,
+    project_id_or_slug: &str,
+    version_id: Option<&str>,
+    mc_version: &str,
+    loader: ModLoader,
+    cache_dir: &Path,
+    instance_mods_dir: &Path,
+) -> Result<ResolvedMod> {
+    let (locked, blob_path) = resolve_modrinth_to_blob(
+        client,
+        project_id_or_slug,
+        version_id,
+        mc_version,
+        loader,
+        cache_dir,
+    )
+    .await?;
+
+    let dest = instance_mods_dir.join(&locked.filename);
+    link_or_copy(&blob_path, &dest)?;
 
     Ok(ResolvedMod {
-        filename: file.filename.clone(),
+        filename: locked.filename,
         destination_path: dest,
-        sha256,
+        sha256: locked.sha256,
     })
 }
 
@@ -456,6 +599,56 @@ mod tests {
         assert!(recorded.len() >= 2);
         assert_eq!(recorded.last().unwrap().0, 1);
         assert_eq!(recorded.last().unwrap().1, 1);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn parse_modrinth_search_response_fixture() {
+        let fixture = r#"{
+          "hits": [
+            {
+              "project_id": "P7dR8mSH",
+              "slug": "fabric-api",
+              "title": "Fabric API",
+              "description": "Lightweight and modular API",
+              "downloads": 95000000,
+              "categories": ["fabric", "library"]
+            }
+          ]
+        }"#;
+        let parsed: ModrinthSearchResponse = serde_json::from_str(fixture).unwrap();
+        assert_eq!(parsed.hits.len(), 1);
+        assert_eq!(parsed.hits[0].slug, "fabric-api");
+        assert_eq!(parsed.hits[0].downloads, 95_000_000);
+    }
+
+    #[tokio::test]
+    async fn blob_store_and_hardlink_populates_mods_dir() {
+        let temp = std::env::temp_dir().join(format!(
+            "deming-blob-hardlink-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_dir = temp.join("cache");
+        let staging = temp.join("staging.jar");
+        let dest = temp.join("instance").join("mods").join("fabric-api.jar");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(&staging, b"blob-content-bytes").unwrap();
+        let sha256 = compute_sha256(&staging).unwrap();
+
+        let blob = store_blob_sha256(&cache_dir, &staging, &sha256).await.unwrap();
+        assert_eq!(
+            blob,
+            crate::util::blob_sha256_path(&cache_dir, &sha256)
+        );
+        assert!(blob.is_file());
+
+        link_or_copy(&blob, &dest).unwrap();
+        assert!(dest.is_file());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"blob-content-bytes");
 
         let _ = std::fs::remove_dir_all(&temp);
     }

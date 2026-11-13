@@ -129,8 +129,9 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
     let windows = find_windows_for_pid(pid);
@@ -144,17 +145,19 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
         let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as usize;
 
         if cloak {
-            let new_style = (ex_style | WS_EX_TOOLWINDOW as usize) & !(WS_EX_APPWINDOW as usize);
+            let cloak_flags =
+                (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
+            let new_style = (ex_style | cloak_flags) & !(WS_EX_APPWINDOW as usize);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
                 SetWindowPos(
                     hwnd,
                     null_mut(),
+                    -32_000,
+                    -32_000,
                     0,
                     0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
             let cloak_val: u32 = 1;
@@ -179,18 +182,21 @@ pub fn cloak_and_hide_from_taskbar(pid: u32, cloak: bool) -> Result<usize> {
                     size_of::<u32>() as u32,
                 )
             };
-            let new_style = (ex_style & !(WS_EX_TOOLWINDOW as usize)) | (WS_EX_APPWINDOW as usize);
+            let cloak_flags =
+                (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) as usize;
+            let new_style = (ex_style & !cloak_flags) | (WS_EX_APPWINDOW as usize);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
                 SetWindowPos(
                     hwnd,
                     null_mut(),
+                    100,
+                    100,
                     0,
                     0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
                 );
+                SetForegroundWindow(hwnd);
             }
             if hr >= 0 {
                 updated += 1;

@@ -11,8 +11,8 @@ pub mod server;
 pub mod win_job;
 
 pub use client::{
-    build_connect_args, run_client, strip_mojang_placeholders, supports_quick_play,
-    ClientLaunchConfig, ClientRunOutcome,
+    build_connect_args, ensure_default_options_txt, rule_supports_early_completion, run_client,
+    strip_mojang_placeholders, supports_quick_play, ClientLaunchConfig, ClientRunOutcome,
 };
 pub use evaluator::{evaluate_rule, EvaluationContext, EvaluationResult};
 pub use scheduler::{AbortHandle, ResourcePermit, ResourceScheduler};

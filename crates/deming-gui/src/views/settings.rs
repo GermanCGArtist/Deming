@@ -142,6 +142,36 @@ pub fn render(ui: &mut egui::Ui, state: &mut UiState, bridge: &GuiBridge) {
                     });
             });
 
+            ui.add_space(10.0);
+
+            card_frame().show(ui, |ui| {
+                ui.label(
+                    RichText::new("Mod Integrations & API Keys")
+                        .size(15.5)
+                        .strong()
+                        .color(ACCENT_EMERALD),
+                );
+                ui.label(
+                    RichText::new(
+                        "Optional CurseForge API key for resolving CurseForge-hosted mods and modpacks.",
+                    )
+                    .size(11.5)
+                    .color(TEXT_MUTED),
+                );
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("CurseForge API Key:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.settings.curseforge_api_key)
+                            .password(!state.settings.show_cf_api_key)
+                            .desired_width(320.0)
+                            .hint_text("Optional ($2a$10$...)"),
+                    );
+                    ui.checkbox(&mut state.settings.show_cf_api_key, "Show");
+                });
+            });
+
             ui.add_space(12.0);
 
             sub_card_frame().show(ui, |ui| {
