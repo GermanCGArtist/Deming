@@ -2,19 +2,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
-use deming_core::{
-    AccountRef, InstanceSpec, ModLoader, ProcessPriority, RunEvent, ServerSpec, TestCompletionRule,
-};
-use deming_runner::client::{build_connect_args, run_client, supports_quick_play, ClientLaunchConfig};
+use deming_core::TestCompletionRule;
+#[cfg(windows)]
+use deming_core::{AccountRef, InstanceSpec, ModLoader, ProcessPriority, RunEvent, ServerSpec};
+use deming_runner::client::{build_connect_args, supports_quick_play};
+#[cfg(windows)]
+use deming_runner::client::{run_client, ClientLaunchConfig};
 use deming_runner::evaluator::{evaluate_rule, EvaluationContext};
 use deming_runner::scheduler::{AbortHandle, ResourceScheduler};
 use deming_runner::screenshot::index_screenshots;
-use deming_runner::server::{
-    pick_free_port, write_eula, write_server_properties, ServerLaunchConfig, ServerProcess,
-};
+use deming_runner::server::{pick_free_port, write_eula, write_server_properties};
+#[cfg(windows)]
+use deming_runner::server::{ServerLaunchConfig, ServerProcess};
+#[cfg(windows)]
 use deming_runner::win_job::{set_cpu_affinity_and_priority, JobHandle};
+#[cfg(windows)]
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
