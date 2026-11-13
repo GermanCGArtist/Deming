@@ -291,7 +291,10 @@ fn sandbox_rejects_parent_traversal_and_external_paths() {
 
     assert!(resolve_sandboxed_path(&base, std::path::Path::new("../outside")).is_err());
     assert!(resolve_sandboxed_path(&base, std::path::Path::new("instances/../../outside")).is_err());
+    #[cfg(windows)]
     assert!(resolve_sandboxed_path(&base, std::path::Path::new("C:/Windows/System32")).is_err());
+    #[cfg(not(windows))]
+    assert!(resolve_sandboxed_path(&base, std::path::Path::new("/etc/passwd")).is_err());
 
     let _ = std::fs::remove_dir_all(base);
 }
