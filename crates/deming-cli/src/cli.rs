@@ -14,7 +14,9 @@ use deming_runner::AbortHandle;
 use serde_json::json;
 
 use crate::mcp;
-use crate::orchestrator::{default_config_path, execute_job_with_ipc, DEFAULT_MSA_CLIENT_ID};
+use crate::orchestrator::{
+    default_config_path, execute_job_with_ipc_options, DEFAULT_MSA_CLIENT_ID,
+};
 
 /// Deming: Pure Rust Minecraft Java Edition mod test orchestrator.
 #[derive(Debug, Parser)]
@@ -143,6 +145,9 @@ pub enum RunAction {
     Submit {
         /// Path to the TestJobSpec JSON file.
         job_file: PathBuf,
+        /// Cloak launched Minecraft client windows (auto-enabled when connected to GUI).
+        #[arg(long)]
+        cloak: bool,
     },
     /// Show the manifest/status of a run.
     Status {
@@ -330,7 +335,7 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
     let reader = RunArchiveReader::new(config.runs_dir());
 
     match cmd.action {
-        RunAction::Submit { job_file } => {
+        RunAction::Submit { job_file, cloak } => {
             let raw = std::fs::read_to_string(&job_file)
                 .with_context(|| format!("failed to read job file {}", job_file.display()))?;
             let job: TestJobSpec = serde_json::from_str(&raw)
@@ -343,7 +348,7 @@ async fn handle_run(cmd: RunCommand, config: &DemingConfig, json_out: bool) -> R
                     let _ = abort_for_sig.abort();
                 }
             });
-            let manifest = execute_job_with_ipc(config, &job, abort).await?;
+            let manifest = execute_job_with_ipc_options(config, &job, abort, cloak).await?;
             sig_task.abort();
 
             if json_out {

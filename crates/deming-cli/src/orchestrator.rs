@@ -46,6 +46,18 @@ pub async fn execute_job_with_ipc(
     job: &TestJobSpec,
     abort: Arc<AbortHandle>,
 ) -> Result<RunManifest> {
+    execute_job_with_ipc_options(config, job, abort, false).await
+}
+
+/// Executes [`execute_job_with_options`] while ensuring an IPC endpoint is active in `config.workspace_dir`.
+///
+/// Automatically enables `cloak_window` when `force_cloak` is true or an external GUI IPC server is connected.
+pub async fn execute_job_with_ipc_options(
+    config: &DemingConfig,
+    job: &TestJobSpec,
+    abort: Arc<AbortHandle>,
+    force_cloak: bool,
+) -> Result<RunManifest> {
     let mut abs_ws = config.workspace_dir.clone();
     if abs_ws.is_relative() {
         abs_ws = std::env::current_dir()
@@ -55,6 +67,7 @@ pub async fn execute_job_with_ipc(
 
     let existing_client = IpcClient::connect(&abs_ws).await.ok();
     let has_existing_server = existing_client.as_ref().is_some_and(|c| c.is_connected());
+    let effective_cloak = force_cloak || has_existing_server;
 
     let mut local_server_task = None;
     let mut local_server_stop = None;
@@ -88,7 +101,8 @@ pub async fn execute_job_with_ipc(
         }
     }
 
-    let result = execute_job(config, job, abort, active_client.as_ref()).await;
+    let result =
+        execute_job_with_options(config, job, abort, active_client.as_ref(), effective_cloak).await;
 
     if let Some(tx) = local_server_stop {
         let _ = tx.send(());
@@ -115,6 +129,18 @@ pub async fn execute_job(
     job: &TestJobSpec,
     abort: Arc<AbortHandle>,
     ipc: Option<&IpcClient>,
+) -> Result<RunManifest> {
+    let auto_cloak = ipc.is_some_and(|c| c.is_connected());
+    execute_job_with_options(config, job, abort, ipc, auto_cloak).await
+}
+
+/// Executes a [`TestJobSpec`] end-to-end with explicit `cloak_window` control.
+pub async fn execute_job_with_options(
+    config: &DemingConfig,
+    job: &TestJobSpec,
+    abort: Arc<AbortHandle>,
+    ipc: Option<&IpcClient>,
+    cloak_window: bool,
 ) -> Result<RunManifest> {
     let mut abs_config = config.clone();
     if abs_config.workspace_dir.is_relative() {
@@ -416,6 +442,7 @@ pub async fn execute_job(
                 event_tx_clone,
                 modrinth_clone,
                 store_clone,
+                cloak_window,
             )
             .await
         });
@@ -501,6 +528,7 @@ async fn run_single_instance(
     event_tx: mpsc::UnboundedSender<RunEvent>,
     modrinth: ModrinthClient,
     account_store: AccountStore,
+    cloak_window: bool,
 ) -> InstanceResult {
     let ram_mb = inst
         .ram_mb
@@ -632,7 +660,7 @@ async fn run_single_instance(
         timeout_secs,
         extra_jvm_args: strip_unexpanded_mojang_args(&profile.jvm_args),
         extra_game_args: strip_unexpanded_mojang_args(&profile.game_args),
-        cloak_window: false,
+        cloak_window,
     };
 
     let outcome = match run_client(launch_cfg, &abort, Some(event_tx.clone())).await {
